@@ -2,6 +2,9 @@ import asyncio
 import json
 from typing import Annotated
 import os
+import sys
+import warnings
+import threading
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.bearer import BearerAuthProvider, RSAKeyPair
@@ -14,6 +17,7 @@ import markdownify
 import httpx
 import readabilipy
 import db
+import quiz_utils
 import re
 
 import logging
@@ -22,15 +26,50 @@ from random import random
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    level=LOG_LEVEL,
+    format=os.getenv(
+        "LOG_FORMAT",
+        "%(asctime)s %(levelname)s %(name)s [pid=%(process)d] %(filename)s:%(lineno)d - %(message)s",
+    ),
 )
 logger = logging.getLogger("mcp_server")
 
-# Backpressure and limits
-PERPLEXITY_MAX_CONCURRENCY = int(os.getenv("PERPLEXITY_MAX_CONCURRENCY", "4"))
-_PERPLEXITY_SEMAPHORE = asyncio.Semaphore(PERPLEXITY_MAX_CONCURRENCY)
+# Route warnings to logging and enable default display
+warnings.simplefilter("default")
+logging.captureWarnings(True)
 
-MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(5 * 1024 * 1024)))  # 5MB default
+
+def _install_global_exception_handlers() -> None:
+    """Install hooks so unhandled exceptions are logged with tracebacks."""
+
+    def _sys_excepthook(exc_type, exc, tb):
+        logging.getLogger("uncaught").error(
+            "Uncaught exception", exc_info=(exc_type, exc, tb)
+        )
+
+    def _thread_excepthook(args: threading.ExceptHookArgs):
+        logging.getLogger("uncaught").error(
+            f"Unhandled exception in thread {args.thread.name}",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = _sys_excepthook
+    threading.excepthook = _thread_excepthook
+
+
+def _asyncio_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    msg = context.get("message")
+    exc = context.get("exception")
+    if exc is not None:
+        logging.getLogger("asyncio").error(
+            f"Unhandled exception in asyncio loop: {msg or type(exc).__name__}",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+    else:
+        logging.getLogger("asyncio").error(
+            f"Unhandled error in asyncio loop: {msg or context}"
+        )
+
 
 # Shared HTTP client with connection pooling
 HTTP_MAX_CONNECTIONS = int(os.getenv("HTTP_MAX_CONNECTIONS", "100"))
@@ -39,14 +78,32 @@ HTTP_LIMITS = httpx.Limits(
     max_keepalive_connections=HTTP_MAX_KEEPALIVE, max_connections=HTTP_MAX_CONNECTIONS
 )
 HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
-HTTP_CLIENT = httpx.AsyncClient(limits=HTTP_LIMITS, timeout=HTTP_TIMEOUT, http2=False)
+
+
+def _httpx_log_response(response: httpx.Response) -> None:
+    try:
+        if response.is_error:
+            req = response.request
+            logging.getLogger("httpx").error(
+                f"HTTP error {response.status_code} {response.reason_phrase} for {req.method} {req.url}"
+            )
+    except Exception:
+        # Avoid propagating logging failures
+        pass
+
+
+HTTP_CLIENT = httpx.AsyncClient(
+    limits=HTTP_LIMITS,
+    timeout=HTTP_TIMEOUT,
+    http2=False,
+    event_hooks={"response": [_httpx_log_response]},
+)
 
 # --- Load environment variables ---
 load_dotenv()
 
 TOKEN = os.environ.get("AUTH_TOKEN")
 MY_NUMBER = os.environ.get("MY_NUMBER")
-PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY")
 assert TOKEN is not None, "Please set AUTH_TOKEN in your .env file"
 assert MY_NUMBER is not None, "Please set MY_NUMBER in your .env file"
 
@@ -98,11 +155,15 @@ class Fetch:
                 headers={"User-Agent": user_agent},
             )
         except httpx.HTTPError as e:
+            logger.exception(f"Fetch failed for {url}")
             raise McpError(
                 ErrorData(code=INTERNAL_ERROR, message=f"Failed to fetch {url}: {e!r}")
             )
 
         if response.status_code >= 400:
+            logger.error(
+                f"Failed to fetch {url} - status code {response.status_code}"
+            )
             raise McpError(
                 ErrorData(
                     code=INTERNAL_ERROR,
@@ -182,6 +243,9 @@ async def _post_with_retries(
         try:
             resp = await HTTP_CLIENT.post(url, headers=headers, json=payload)
         except httpx.HTTPError:
+            logger.warning(
+                f"POST {url} network error on attempt {attempt}/{attempts}; retrying"
+            )
             if attempt == attempts:
                 raise
             delay = min(8.0, base * (2 ** (attempt - 1)) + random() * 0.2)
@@ -189,6 +253,9 @@ async def _post_with_retries(
             continue
 
         if resp.status_code in (429, 500, 502, 503, 504):
+            logger.warning(
+                f"POST {url} got status {resp.status_code} on attempt {attempt}/{attempts}; retrying"
+            )
             if attempt == attempts:
                 return resp
             retry_after = resp.headers.get("retry-after")
@@ -276,8 +343,8 @@ def _confidence_by_axis(
 
 GenerateQuizDescription = RichToolDescription(
     description=(
-       "Generate a short MBTI-style 16-type questionnaire. Present ALL questions at once, "
-        "collect '{1a 2b ...}', then call submit_quiz_compact(user_id, quiz_json, answers_compact)."
+        "Generate a fixed MBTI-style questionnaire (16 items: 4 per axis). Present ALL questions at once, "
+        "collect '{1a 2b ...}', then call submit_quiz_compact(user_id, answers_compact)."
     ),
     use_when="User needs a ready-to-ask quiz to compute type with submit_quiz_compact.",
     side_effects=None,
@@ -372,17 +439,18 @@ def _question_bank(axis: str, variant: str) -> list[dict]:
 @mcp.tool(description=GenerateQuizDescription.model_dump_json())
 async def generate_quiz(
     num_per_axis: Annotated[
-        int, Field(description="Number of items per axis; typical 3-5.")
+        int, Field(description="Ignored. Always 4 per axis.")
     ] = 4,
     variant: Annotated[
-        str, Field(description="Question context: general | work | social.")
+        str, Field(description="Ignored. Always uses 'general'.")
     ] = "general",
 ) -> str:
-    num = max(2, min(8, int(num_per_axis)))
+    # Fixed configuration: 4 questions per axis, using the 'general' bank only
+    num = 4
     axes = ["EI", "SN", "TF", "JP"]
     questions: list[dict] = []
     for axis in axes:
-        bank = _question_bank(axis, variant)
+        bank = _question_bank(axis, "general")
         if not bank:
             continue
         slice_items = bank[:num]
@@ -398,7 +466,7 @@ async def generate_quiz(
 
     payload = {
         "version": "1.0",
-        "variant": variant,
+        "variant": "fixed",
         "scale": {
             "labels": [
                 "Strongly disagree",
@@ -415,15 +483,14 @@ async def generate_quiz(
         "instructions": (
         "Present ALL questions at once. Ask the user to reply with a compact string like "
         "'{1a 2b 3c ...}'. Supported: a..d -> -3,-1,1,3 or a..g -> -3..3. "
-        "After collecting, call submit_quiz_compact(user_id, quiz_json=<this payload>, answers_compact='{...}')."),
+        "After collecting, call submit_quiz_compact(user_id, answers_compact='{...}')."),
         "questions": questions,
     }
     return json.dumps(payload)
 
 SubmitQuizCompactDescription = RichToolDescription(
     description=(
-        "Submit compact quiz answers in one call. Provide the raw JSON from generate_quiz as quiz_json, "
-        "and answers_compact as a space-separated string of question-answer pairs.\n\n"
+        "Submit compact quiz answers in one call. Provide answers_compact as a space-separated string of question-answer pairs.\n\n"
         "Format: '1a 2b 3c 4d 5e 6f 7g 8a 9c 10e 11b 12f 13d 14g 15a 16c'\n"
         "- Numbers (1,2,3...) = question index (1-based)\n"
         "- Letters map to values:\n"
@@ -442,20 +509,26 @@ SubmitQuizCompactDescription = RichToolDescription(
 @mcp.tool(description=SubmitQuizCompactDescription.model_dump_json())
 async def submit_quiz_compact(
     user_id: Annotated[str, Field(description="Unique ID of the user submitting the quiz.")],
-    quiz_json: Annotated[str, Field(description="The exact JSON string returned by generate_quiz.")],
     answers_compact: Annotated[str, Field(description="Compact response string like '{1a 2b 3c ...}'.")],
 ) -> str:
     if not user_id:
         raise McpError(ErrorData(code=INVALID_PARAMS, message="user_id is required"))
-    try:
-        quiz = json.loads(quiz_json)
-    except Exception:
-        raise McpError(ErrorData(code=INVALID_PARAMS, message="quiz_json must be valid JSON from generate_quiz"))
-    questions = quiz.get("questions") or []
-    if not isinstance(questions, list) or not questions:
-        raise McpError(ErrorData(code=INVALID_PARAMS, message="quiz_json missing questions"))
+    # Reconstruct the fixed questions (deterministic) instead of requiring quiz_json
+    axes = ["EI", "SN", "TF", "JP"]
+    questions: list[dict] = []
+    for axis in axes:
+        bank = _question_bank(axis, "general")
+        for idx, itm in enumerate(bank[:4], start=1):
+            questions.append(
+                {
+                    "id": f"{axis}-{idx}",
+                    "axis": axis,
+                    "prompt": itm["prompt"],
+                    "positive_pole": itm["positive_pole"],
+                }
+            )
 
-    tokens = re.findall(r"(\\d+)\\s*([a-gA-G])", answers_compact or "")
+    tokens = quiz_utils.parse_compact_tokens(answers_compact or "")
     if not tokens:
         raise McpError(ErrorData(code=INVALID_PARAMS, message="answers_compact must contain entries like '1a 2d'"))
 
@@ -469,12 +542,13 @@ async def submit_quiz_compact(
         return map7.get(ch, map4.get(ch))
 
     responses: list[dict] = []
-    for idx_str, ch in tokens:
-        i = int(idx_str) - 1
+    for idx, raw_val in tokens:
+        i = int(idx) - 1
         if i < 0 or i >= len(questions):
             continue
         q = questions[i]
-        v = letter_value(ch)
+        # Allow letters, numbers, or text phrases
+        v = quiz_utils.sanitize_value(raw_val)
         if v is None:
             continue
         axis = q.get("axis")
@@ -488,28 +562,30 @@ async def submit_quiz_compact(
         raise McpError(ErrorData(code=INVALID_PARAMS, message="No valid responses parsed"))
 
     # Reuse existing flow (validates, stores, returns {type, confidence_by_axis})
-    return await submit_quiz(user_id=user_id, responses=responses)
+    # Include persistence of raw and sanitized answers
+    result_json = await submit_quiz(user_id=user_id, responses=responses)
+    return result_json
 
 
 SubmitQuizDescription = RichToolDescription(
     description=(
-        "Submit a short 16-type quiz. Each response item should include axis in {EI,SN,TF,JP} and a numeric value [-3..3]."
-        " Returns {type, confidence_by_axis}. Also stores the result for the given user_id."
+        "Submit a short 16-type quiz. Accepts robust inputs: list of {axis, value} or strings like 'EI: a' or 'tf = strongly agree'. "
+        "Values can be letters (a..g), numbers (-3..3), or Likert text. Returns {type, confidence_by_axis}. Stores results for user_id."
     ),
     use_when="User has completed a brief MBTI-style quiz and you need to compute their type and confidence.",
     side_effects="Stores quiz result to DB for matching.",
 )
 
 
-# @mcp.tool(description=SubmitQuizDescription.model_dump_json())
+@mcp.tool(description=SubmitQuizDescription.model_dump_json())
 async def submit_quiz(
     user_id: Annotated[
         str, Field(description="Unique ID of the user submitting the quiz.")
     ],
     responses: Annotated[
-        list[dict],
+        list[dict | str],
         Field(
-            description="Array of {axis, value} objects. axis in {EI,SN,TF,JP}; value -3..3."
+            description="Array of items: either {axis, value} objects or strings like 'EI: a'. axis in {EI,SN,TF,JP}; value -3..3 or Likert text."
         ),
     ],
 ) -> str:
@@ -523,7 +599,24 @@ async def submit_quiz(
             )
         )
 
-    confidence, sums = _confidence_by_axis(responses)
+    # Sanitize and normalize payload
+    try:
+        sanitized_list = quiz_utils.sanitize_responses(responses)
+    except Exception:
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS, message="Invalid responses format; unable to sanitize"
+            )
+        )
+    if not sanitized_list:
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS,
+                message="No valid responses after sanitization",
+            )
+        )
+
+    confidence, sums = _confidence_by_axis(sanitized_list)
     mbti = _derive_mbti_from_axis(sums)
     try:
         await db.upsert_users_quiz(
@@ -532,10 +625,12 @@ async def submit_quiz(
             mbti=mbti,
             confidence_by_axis=confidence,
             axis_sums=sums,
+            raw_answers=responses,
+            sanitized_answers=sanitized_list,
         )
         logger.info(f"[submit_quiz] upsert users_quiz ok user_id={user_id}")
     except (httpx.HTTPError, RuntimeError) as e:
-        logger.error(f"[submit_quiz] users_quiz error user_id={user_id} err={e!r}")
+        logger.exception(f"[submit_quiz] users_quiz error user_id={user_id}")
         raise McpError(
             ErrorData(code=INTERNAL_ERROR, message=f"Failed to store quiz: {e!r}")
         )
@@ -577,7 +672,9 @@ async def save_profile(
         if rows:
             quiz_type = (rows[0] or {}).get("type")
     except (httpx.HTTPError, RuntimeError) as e:
-        logger.error(f"[save_profile] read users_quiz error user_id={user_id} err={e!r}")
+        logger.exception(
+            f"[save_profile] read users_quiz error user_id={user_id}"
+        )
         # continue with fallback
     final_type = _normalize_mbti_type(type or quiz_type or "XXXX")
 
@@ -606,7 +703,9 @@ async def save_profile(
         )
         logger.info(f"[save_profile] upsert users_profile ok user_id={user_id}")
     except (httpx.HTTPError, RuntimeError) as e:
-        logger.error(f"[save_profile] users_profile error user_id={user_id} err={e!r}")
+        logger.exception(
+            f"[save_profile] users_profile error user_id={user_id}"
+        )
         raise McpError(
             ErrorData(code=INTERNAL_ERROR, message=f"Failed to save profile: {e!r}")
         )
@@ -706,7 +805,9 @@ async def find_matches(
     try:
         me = await db.get_user_profile(HTTP_CLIENT, user_id)
     except (httpx.HTTPError, RuntimeError) as e:
-        logger.error(f"[find_matches] read users_profile error user_id={user_id} err={e!r}")
+        logger.exception(
+            f"[find_matches] read users_profile error user_id={user_id}"
+        )
         raise McpError(
             ErrorData(code=INTERNAL_ERROR, message=f"Failed to load profile: {e!r}")
         )
@@ -725,7 +826,9 @@ async def find_matches(
     try:
         all_profiles = await db.get_all_profiles(HTTP_CLIENT)
     except (httpx.HTTPError, RuntimeError) as e:
-        logger.error(f"[find_matches] list profiles error user_id={user_id} err={e!r}")
+        logger.exception(
+            f"[find_matches] list profiles error user_id={user_id}"
+        )
         raise McpError(
             ErrorData(code=INTERNAL_ERROR, message=f"Failed to load profiles: {e!r}")
         )
@@ -744,7 +847,9 @@ async def find_matches(
             if row and "user_id" in row:
                 quiz_map[row["user_id"]] = row.get("confidence_by_axis") or {}
     except (httpx.HTTPError, RuntimeError) as e:
-        logger.error(f"[find_matches] read users_quiz error user_id={user_id} err={e!r}")
+        logger.exception(
+            f"[find_matches] read users_quiz error user_id={user_id}"
+        )
         # proceed without confidences
 
     my_conf = quiz_map.get(user_id)
@@ -826,7 +931,9 @@ async def create_room(
         u1 = await db.get_user_profile(HTTP_CLIENT, user_a)
         u2 = await db.get_user_profile(HTTP_CLIENT, user_b)
     except (httpx.HTTPError, RuntimeError) as e:
-        logger.error(f"[create_room] load profiles error match_id={match_id} err={e!r}")
+        logger.exception(
+            f"[create_room] load profiles error match_id={match_id}"
+        )
         raise McpError(
             ErrorData(code=INTERNAL_ERROR, message=f"Failed to load profiles: {e!r}")
         )
@@ -864,7 +971,7 @@ async def create_room(
         room_id = str(row.get("room_id") or uuid.uuid4())
         logger.info(f"[create_room] created rooms row room_id={room_id}")
     except (httpx.HTTPError, RuntimeError) as e:
-        logger.error(f"[create_room] rooms error match_id={match_id} err={e!r}")
+        logger.exception(f"[create_room] rooms error match_id={match_id}")
         raise McpError(
             ErrorData(code=INTERNAL_ERROR, message=f"Failed to create room: {e!r}")
         )
@@ -938,8 +1045,8 @@ async def set_counterpart(
         await db.upsert_counterpart(HTTP_CLIENT, user_id=user_id, counterpart_type=t)
         logger.info(f"[set_counterpart] upsert user_counterpart_type ok user_id={user_id}")
     except (httpx.HTTPError, RuntimeError) as e:
-        logger.error(
-            f"[set_counterpart] user_counterpart_type error user_id={user_id} err={e!r}"
+        logger.exception(
+            f"[set_counterpart] user_counterpart_type error user_id={user_id}"
         )
         raise McpError(
             ErrorData(
@@ -1016,8 +1123,8 @@ async def coach_tip(
         try:
             t = await db.get_counterpart(HTTP_CLIENT, user_id)
         except (httpx.HTTPError, RuntimeError) as e:
-            logger.error(
-                f"[coach_tip] read user_counterpart_type error user_id={user_id} err={e!r}"
+            logger.exception(
+                f"[coach_tip] read user_counterpart_type error user_id={user_id}"
             )
             raise McpError(
                 ErrorData(
@@ -1084,203 +1191,15 @@ async def translate(
     return json.dumps({"target_type": t, "rewritten": rewritten})
 
 
-AnalyzeIngredientsDescription = RichToolDescription(
-    description="Analyze a product label image for ingredient safety categories using Perplexity (sonar-pro). Returns JSON plus citations.",
-    use_when="Use when given a product label image and the user wants a structured ingredient safety analysis.",
-    side_effects="Optionally stores to Firestore if configured.",
-)
-
-
-@mcp.tool(description=AnalyzeIngredientsDescription.model_dump_json())
-async def analyze_ingredients(
-    puch_image_data: Annotated[
-        str,
-        Field(
-            description="Base64-encoded image data. Either raw base64 or full data URI starting with 'data:'."
-        ),
-    ],
-    mime_type: Annotated[
-        str, Field(description="MIME type of the image if raw base64 is provided.")
-    ] = "image/jpeg",
-    user_id: Annotated[
-        str | None, Field(description="User id to associate with the scan if storing.")
-    ] = None,
-    store: Annotated[
-        bool, Field(description="Store scan to Firestore if configured.")
-    ] = True,
-) -> str:
-    # Validate size early to avoid memory blowups
-    b64 = _extract_b64(puch_image_data)
-    raw_size = _approx_raw_size(b64)
-    if raw_size > MAX_IMAGE_BYTES:
-        raise McpError(
-            ErrorData(
-                code=INVALID_PARAMS,
-                message=f"Image too large: {raw_size} bytes > max {MAX_IMAGE_BYTES} bytes",
-            )
-        )
-
-    image_data_uri = (
-        puch_image_data
-        if puch_image_data.startswith("data:")
-        else f"data:{mime_type};base64,{puch_image_data}"
-    )
-
-    request_id = str(uuid.uuid4())
-    logger.info(
-        f"[{request_id}] analyze_ingredients start user_id={user_id} size={raw_size}"
-    )
-
-    prompt = """
-You are an AI assistant that analyzes food product ingredient labels for health and safety. Given a list of ingredients, categorize them into the following:
-
-- Safe
-- Low Risk
-- Not Great
-- Dangerous
-
-Your response MUST be a valid JSON object and contain no additional formatting or markdown. Return ONLY the JSON object. Do not include any text outside the JSON.
-
-Your task includes:
-
-1. Identify the product name from the label (if available).
-2. Provide a general safety score (e.g., "Safe: 95%").
-3. Provide a 2-3 sentence summary of the ingredient safety profile.
-4. For each category (safe, low_risk, not_great, dangerous):
-   - Include only the names of ingredients (for use in collapsed UI cards).
-   - Include a breakdown with:
-     - The ingredient name
-     - A short reason for the classification
-     - The amount present in the product (if known; otherwise use "unknown")
-
-Additionally:
-
-5. Include an "allergen_additive_warnings" field:
-   - A list of any potential allergens (e.g., milk, soy, gluten) or additives (e.g., colorants, preservatives) if mentioned or implied.
-   - If none are found, use ["None"].
-
-6. Include a "product_summary" field:
-   - A single-sentence summary that briefly describes the nature and safety of the product.
-
-Use this exact JSON structure:
-
-{
-  "product_name": "string - Name of the product (if visible on label)",
-  "safety_score": "string - e.g. 'Safe: 95%'",
-  "ingredients_summary": "string - Overall summary paragraph about safety and risks",
-  "ingredient_categories": {
-    "safe": {
-      "ingredients": ["array of safe ingredient names"],
-      "details": [
-        {
-          "ingredient": "ingredient name",
-          "reason": "short explanation of why it's considered safe",
-          "amount": "string - amount if known, e.g., '5g' or '2%', else 'unknown'"
-        }
-      ]
-    },
-    "low_risk": {
-      "ingredients": ["array of low risk ingredient names"],
-      "details": [
-        {
-          "ingredient": "ingredient name",
-          "reason": "short explanation of why it's considered low risk",
-          "amount": "string - amount if known, e.g., '5g' or '2%', else 'unknown'"
-        }
-      ]
-    },
-    "not_great": {
-      "ingredients": ["array of not great ingredient names"],
-      "details": [
-        {
-          "ingredient": "ingredient name",
-          "reason": "short explanation of why it's considered not great",
-          "amount": "string - amount if known, e.g., '5g' or '2%', else 'unknown'"
-        }
-      ]
-    },
-    "dangerous": {
-      "ingredients": ["array of dangerous ingredient names or ['None'] if none"],
-      "details": [
-        {
-          "ingredient": "ingredient name",
-          "reason": "short explanation of why it's considered dangerous",
-          "amount": "string - amount if known, e.g., '5g' or '2%', else 'unknown'"
-        }
-      ]
-    }
-  },
-  "allergen_additive_warnings": ["list of allergens or additives, or ['None']"],
-  "product_summary": "string - One sentence describing the product's general purpose and safety"
-}
-"""
-
-    payload: dict = {
-        "model": "sonar-pro",
-        "messages": [
-            {"role": "system", "content": "Be precise and concise."},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_data_uri}},
-                ],
-            },
-        ],
-    }
-
-    if os.getenv("PERPLEXITY_WEB_SEARCH", "false").lower() in ("1", "true", "yes"):
-        payload["web_search_options"] = {"search_context_size": "medium"}
-
-    if not PERPLEXITY_API_KEY:
-        raise McpError(
-            ErrorData(
-                code=INTERNAL_ERROR,
-                message="Perplexity API key not configured on this server",
-            )
-        )
-
-    headers = {
-        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-        "accept": "application/json",
-        "content-type": "application/json",
-        "X-Request-ID": request_id,
-    }
-
-    try:
-        async with _PERPLEXITY_SEMAPHORE:
-            resp = await _post_with_retries(
-                "https://api.perplexity.ai/chat/completions",
-                headers=headers,
-                payload=payload,
-                attempts=3,
-            )
-
-        if resp.status_code >= 400:
-            raise McpError(
-                ErrorData(
-                    code=INTERNAL_ERROR,
-                    message=f"Perplexity error {resp.status_code}: {resp.text[:300]}",
-                )
-            )
-
-        data = resp.json()
-        logger.info(f"[{request_id}] analyze_ingredients ok")
-        return json.dumps(data)
-
-    except httpx.HTTPError as e:
-        logger.error(f"[{request_id}] network error: {e!r}")
-        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Network error: {e!r}"))
-    except Exception as e:
-        logger.exception(f"[{request_id}] unexpected error")
-        raise McpError(ErrorData(code=INTERNAL_ERROR, message=str(e)))
-
-
 # --- Run MCP Server ---
 async def main():
-    logger.info(
-        f"🚀 Starting MCP server on http://0.0.0.0:8086 (concurrency={PERPLEXITY_MAX_CONCURRENCY})"
-    )
+    # Install asyncio exception handler for better visibility
+    try:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(_asyncio_exception_handler)
+    except RuntimeError:
+        pass
+    logger.info("🚀 Starting MCP server on http://0.0.0.0:8086")
     try:
         await mcp.run_async("streamable-http", host="0.0.0.0", port=8086)
     finally:
@@ -1289,4 +1208,10 @@ async def main():
 
 
 if __name__ == "__main__":
+    _install_global_exception_handlers()
+    # Tame noisy third-party logs unless DEBUG
+    if logging.getLogger().getEffectiveLevel() > logging.DEBUG:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("hpack").setLevel(logging.WARNING)
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
     asyncio.run(main())

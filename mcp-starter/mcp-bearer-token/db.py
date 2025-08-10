@@ -55,15 +55,22 @@ async def upsert_users_quiz(
     mbti: str,
     confidence_by_axis: dict,
     axis_sums: dict,
+    raw_answers: dict | list | str | None = None,
+    sanitized_answers: dict | list | None = None,
 ) -> dict:
-    payload = [
-        {
-            "user_id": user_id,
-            "type": mbti,
-            "confidence_by_axis": confidence_by_axis,
-            "axis_sums": axis_sums,
-        }
-    ]
+    payload_item: dict = {
+        "user_id": user_id,
+        "type": mbti,
+        "confidence_by_axis": confidence_by_axis,
+        "axis_sums": axis_sums,
+    }
+    # Only include optional fields if provided to avoid overwriting with null
+    if raw_answers is not None:
+        payload_item["raw_answers"] = raw_answers
+    if sanitized_answers is not None:
+        payload_item["sanitized_answers"] = sanitized_answers
+
+    payload = [payload_item]
     resp = await client.post(
         _tbl("users_quiz?on_conflict=user_id"), headers=_upsert_headers(), json=payload
     )
