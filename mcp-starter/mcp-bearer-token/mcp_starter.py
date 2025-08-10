@@ -434,7 +434,7 @@ def _question_bank(axis: str, variant: str) -> list[dict]:
     return []
 
 
-@mcp.tool(description=GenerateQuizDescription.model_dump_json())
+# @mcp.tool(description=GenerateQuizDescription.model_dump_json())
 async def generate_quiz(
     num_per_axis: Annotated[
         int, Field(description="Ignored. Always 4 per axis.")
@@ -972,36 +972,6 @@ async def create_room(
     })
 
 
-###############################################
-# Diagnostics level tooling (get/set)
-###############################################
-
-DiagnosticsDescription = RichToolDescription(
-    description="Get or set diagnostics (log) level for the server.",
-    use_when="You need more or less verbose server logs during judging.",
-    side_effects="Changing level affects subsequent logs.",
-)
-
-
-@mcp.tool(description=DiagnosticsDescription.model_dump_json())
-async def diagnostics_level_get() -> str:
-    level = logging.getLevelName(logger.getEffectiveLevel())
-    return json.dumps({"level": level})
-
-
-@mcp.tool(description=DiagnosticsDescription.model_dump_json())
-async def diagnostics_level_set(
-    level: Annotated[
-        str, Field(description="One of DEBUG, INFO, WARNING, ERROR, CRITICAL.")
-    ]
-) -> str:
-    lvl = level.upper().strip()
-    if lvl not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
-        raise McpError(ErrorData(code=INVALID_PARAMS, message="Invalid level"))
-    logging.getLogger().setLevel(lvl)
-    logger.setLevel(lvl)
-    return json.dumps({"ok": True, "level": lvl})
-
 
 ###############################################
 # Type Coach: counterpart, tips, translate
@@ -1177,6 +1147,102 @@ async def translate(
         )
     rewritten = _rewrite_for_type(message, t)
     return json.dumps({"target_type": t, "rewritten": rewritten})
+
+
+GetUserPersonalityDescription = RichToolDescription(
+    description=(
+        "Get user's personality type, either from database or by generating a quiz if needed. "
+        "Checks for existing personality data first to avoid redundant quiz prompts. "
+        "Returns stored type with confidence scores, or generates new quiz if no data exists."
+    ),
+    use_when="User asks about their personality type or when personality data is needed for matching.",
+    side_effects="May generate quiz if no existing data found.",
+)
+
+
+@mcp.tool(description=GetUserPersonalityDescription.model_dump_json())
+async def get_user_personality(
+    user_id: Annotated[str, Field(description="User ID to get personality for.")],
+    force_retake: Annotated[bool, Field(description="Force user to retake quiz even if exists.")] = False,
+) -> str:
+    """Smart personality retrieval that avoids unnecessary quiz prompts."""
+    
+    # Check if user already has personality data
+    if not force_retake:
+        try:
+            rows = await db.get_users_quiz_by_ids(HTTP_CLIENT, [user_id])
+            if rows:
+                existing_data = rows[0]
+                personality_type = existing_data.get("type")
+                confidence = existing_data.get("confidence_by_axis", {})
+                created_at = existing_data.get("created_at")
+                
+                return json.dumps({
+                    "has_existing": True,
+                    "type": personality_type,
+                    "confidence_by_axis": confidence,
+                    "created_at": created_at,
+                    "message": f"Your personality type is {personality_type}. This was determined on {created_at}."
+                })
+        except Exception as e:
+            logger.exception(f"Error checking existing personality for {user_id}")
+    
+    # No existing data or force retake - generate quiz
+    quiz_data = await generate_quiz()
+    return json.dumps({
+        "has_existing": False,
+        "quiz_data": json.loads(quiz_data),
+        "message": "Please take this personality quiz to determine your type."
+    })
+
+
+CheckUserDataStatusDescription = RichToolDescription(
+    description=(
+        "Check what data we have for a user to avoid redundant requests. "
+        "Returns comprehensive status including personality type, profile data, and last quiz date. "
+        "Use this to guide conversation flow and prevent asking users to repeat actions they've already completed."
+    ),
+    use_when="Before prompting user for data or actions, to check what information already exists.",
+    side_effects=None,
+)
+
+
+@mcp.tool(description=CheckUserDataStatusDescription.model_dump_json())
+async def check_user_data_status(
+    user_id: Annotated[str, Field(description="User ID to check data status for.")],
+) -> str:
+    """Check what data exists for a user to guide conversation flow."""
+    
+    status = {
+        "user_id": user_id,
+        "has_personality_type": False,
+        "has_profile": False,
+        "has_matches": False,
+        "personality_type": None,
+        "last_quiz_date": None
+    }
+    
+    # Check personality data
+    try:
+        quiz_rows = await db.get_users_quiz_by_ids(HTTP_CLIENT, [user_id])
+        if quiz_rows:
+            quiz_data = quiz_rows[0]
+            status.update({
+                "has_personality_type": True,
+                "personality_type": quiz_data.get("type"),
+                "last_quiz_date": quiz_data.get("created_at")
+            })
+    except Exception:
+        pass
+    
+    # Check profile data
+    try:
+        profile = await db.get_user_profile(HTTP_CLIENT, user_id)
+        status["has_profile"] = profile is not None
+    except Exception:
+        pass
+    
+    return json.dumps(status)
 
 
 # --- Run MCP Server ---
