@@ -16,6 +16,14 @@ MCP (Model Context Protocol) allows AI assistants like Puch to connect to extern
 ### 🖼️ Image Processing Tool
 - **Convert images to black & white** - Upload any image and get a monochrome version
 
+### 💬 Type-to-Talk Matching & Coaching (NEW)
+- **generate_quiz** → produce a compact MBTI-style questionnaire
+- **submit_quiz** → compute 16-type and confidence-by-axis
+- **save_profile** → store preferences (availability, topics, intent)
+- **find_matches** → ranked candidates with plain-language rationales
+- **create_room** → private room with tokens and starter prompts
+- **set_counterpart / coach_tip / translate** → micro-coaching & tone translator
+
 ### 🔐 Built-in Authentication
 - Bearer token authentication (required by Puch AI)
 - Validation tool that returns your phone number
@@ -51,6 +59,8 @@ Then edit `.env` and add your details:
 ```env
 AUTH_TOKEN=your_secret_token_here
 MY_NUMBER=919876543210
+# Optional for ingredients analyzer only
+# PERPLEXITY_API_KEY=...
 ```
 
 **Important Notes:**
@@ -101,6 +111,45 @@ You can also deploy this to services like:
    ```
    /mcp connect https://your-domain.ngrok.app/mcp your_secret_token_here
    ```
+
+### Quick Demo via Puch Commands (Type‑to‑Talk)
+
+1) Verify server & phone
+```
+/mcp validate
+```
+
+2) Generate & submit quiz
+```
+/mcp tool generate_quiz {"num_per_axis":4,"variant":"general"}
+```
+Use the returned `questions` with the provided Likert scale. Then submit:
+```
+/mcp tool submit_quiz {"user_id":"u1","responses":[{"axis":"EI","value":2},{"axis":"SN","value":-1},{"axis":"TF","value":3},{"axis":"JP","value":1}]}
+```
+
+3) Save profiles
+```
+/mcp tool save_profile {"user_id":"u1","preferences":{"availability":[{"day":"mon","start":"18:00","end":"20:00"}],"topics":["startups","ai"],"intent":"networking"}}
+/mcp tool save_profile {"user_id":"u2","type":"ENFP","preferences":{"availability":[{"day":"mon","start":"19:00","end":"21:00"}],"topics":["ai","design"],"intent":"networking"}}
+```
+
+4) Find matches and create room
+```
+/mcp tool find_matches {"user_id":"u1","limit":3}
+/mcp tool create_room {"match_id":"u1|u2"}
+```
+
+5) Coaching utilities
+```
+/mcp tool set_counterpart {"user_id":"u1","counterpart_type":"INTJ"}
+/mcp tool coach_tip {"user_id":"u1","context":"give feedback about missed deadline"}
+/mcp tool translate {"message":"Hey, can we review the plan and adjust our deadline?","target_type":"ISFJ"}
+```
+
+Notes:
+- Matching and rooms use in-memory storage for demo; restarting clears state.
+- Ingredients analyzer requires `PERPLEXITY_API_KEY`. Type‑to‑Talk tools work without it.
 
 ### Debug Mode
 

@@ -14,21 +14,47 @@ import markdownify
 import httpx
 import readabilipy
 
+import logging
+import uuid
+from random import random
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+)
+logger = logging.getLogger("mcp_server")
+
+# Backpressure and limits
+PERPLEXITY_MAX_CONCURRENCY = int(os.getenv("PERPLEXITY_MAX_CONCURRENCY", "4"))
+_PERPLEXITY_SEMAPHORE = asyncio.Semaphore(PERPLEXITY_MAX_CONCURRENCY)
+
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(5 * 1024 * 1024)))  # 5MB default
+
+# Shared HTTP client with connection pooling
+HTTP_MAX_CONNECTIONS = int(os.getenv("HTTP_MAX_CONNECTIONS", "100"))
+HTTP_MAX_KEEPALIVE = int(os.getenv("HTTP_MAX_KEEPALIVE", "20"))
+HTTP_LIMITS = httpx.Limits(
+    max_keepalive_connections=HTTP_MAX_KEEPALIVE, max_connections=HTTP_MAX_CONNECTIONS
+)
+HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+HTTP_CLIENT = httpx.AsyncClient(limits=HTTP_LIMITS, timeout=HTTP_TIMEOUT, http2=False)
+
 # --- Load environment variables ---
 load_dotenv()
 
 TOKEN = os.environ.get("AUTH_TOKEN")
 MY_NUMBER = os.environ.get("MY_NUMBER")
 PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY")
-print(TOKEN, MY_NUMBER) 
 assert TOKEN is not None, "Please set AUTH_TOKEN in your .env file"
 assert MY_NUMBER is not None, "Please set MY_NUMBER in your .env file"
-assert PERPLEXITY_API_KEY is not None, "Please set PERPLEXITY_API_KEY in your .env file"
+# Perplexity is optional for this server; analyze_ingredients will error if missing
 # --- Auth Provider ---
 class SimpleBearerAuthProvider(BearerAuthProvider):
     def __init__(self, token: str):
         k = RSAKeyPair.generate()
-        super().__init__(public_key=k.public_key, jwks_uri=None, issuer=None, audience=None)
+        super().__init__(
+            public_key=k.public_key, jwks_uri=None, issuer=None, audience=None
+        )
         self.token = token
 
     async def load_access_token(self, token: str) -> AccessToken | None:
@@ -41,11 +67,13 @@ class SimpleBearerAuthProvider(BearerAuthProvider):
             )
         return None
 
+
 # --- Rich Tool Description model ---
 class RichToolDescription(BaseModel):
     description: str
     use_when: str
     side_effects: str | None = None
+
 
 # --- Fetch Utility Class ---
 class Fetch:
@@ -58,21 +86,27 @@ class Fetch:
         user_agent: str,
         force_raw: bool = False,
     ) -> tuple[str, str]:
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(
-                    url,
-                    follow_redirects=True,
-                    headers={"User-Agent": user_agent},
-                    timeout=60,
+        client = HTTP_CLIENT
+        try:
+            response = await client.get(
+                url,
+                follow_redirects=True,
+                headers={"User-Agent": user_agent},
+            )
+        except httpx.HTTPError as e:
+            raise McpError(
+                ErrorData(code=INTERNAL_ERROR, message=f"Failed to fetch {url}: {e!r}")
+            )
+
+        if response.status_code >= 400:
+            raise McpError(
+                ErrorData(
+                    code=INTERNAL_ERROR,
+                    message=f"Failed to fetch {url} - status code {response.status_code}",
                 )
-            except httpx.HTTPError as e:
-                raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to fetch {url}: {e!r}"))
+            )
 
-            if response.status_code >= 400:
-                raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to fetch {url} - status code {response.status_code}"))
-
-            page_raw = response.text
+        page_raw = response.text
 
         content_type = response.headers.get("content-type", "")
         is_page_html = "text/html" in content_type
@@ -88,7 +122,9 @@ class Fetch:
     @staticmethod
     def extract_content_from_html(html: str) -> str:
         """Extract and convert HTML content to Markdown format."""
-        ret = readabilipy.simple_json.simple_json_from_html_string(html, use_readability=True)
+        ret = readabilipy.simple_json.simple_json_from_html_string(
+            html, use_readability=True
+        )
         if not ret or not ret.get("content"):
             return "<error>Page failed to be simplified from HTML</error>"
         content = markdownify.markdownify(ret["content"], heading_style=markdownify.ATX)
@@ -103,12 +139,13 @@ class Fetch:
         ddg_url = f"https://html.duckduckgo.com/html/?q={query.replace(' ', '+')}"
         links = []
 
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(ddg_url, headers={"User-Agent": Fetch.USER_AGENT})
-            if resp.status_code != 200:
-                return ["<error>Failed to perform search.</error>"]
+        client = HTTP_CLIENT
+        resp = await client.get(ddg_url, headers={"User-Agent": Fetch.USER_AGENT})
+        if resp.status_code != 200:
+            return ["<error>Failed to perform search.</error>"]
 
         from bs4 import BeautifulSoup
+
         soup = BeautifulSoup(resp.text, "html.parser")
         for a in soup.find_all("a", class_="result__a", href=True):
             href = a["href"]
@@ -119,9 +156,51 @@ class Fetch:
 
         return links or ["<error>No results found.</error>"]
 
+
+def _extract_b64(data: str) -> str:
+    if data.startswith("data:"):
+        idx = data.find("base64,")
+        if idx != -1:
+            return data[idx + 7 :]
+    return data
+
+
+def _approx_raw_size(b64: str) -> int:
+    pad = b64.count("=")
+    return (len(b64) * 3) // 4 - pad
+
+
+async def _post_with_retries(
+    url: str, headers: dict, payload: dict, attempts: int = 3
+) -> httpx.Response:
+    base = 0.5
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = await HTTP_CLIENT.post(url, headers=headers, json=payload)
+        except httpx.HTTPError:
+            if attempt == attempts:
+                raise
+            delay = min(8.0, base * (2 ** (attempt - 1)) + random() * 0.2)
+            await asyncio.sleep(delay)
+            continue
+
+        if resp.status_code in (429, 500, 502, 503, 504):
+            if attempt == attempts:
+                return resp
+            retry_after = resp.headers.get("retry-after")
+            if retry_after and retry_after.isdigit():
+                delay = min(10.0, float(retry_after))
+            else:
+                delay = min(8.0, base * (2 ** (attempt - 1)) + random() * 0.2)
+            await asyncio.sleep(delay)
+            continue
+        return resp
+    return resp
+
+
 # --- MCP Server Setup ---
 mcp = FastMCP(
-    "Analyze Ingredients MCP Server",
+    "Type-to-Talk MCP Server",
     auth=SimpleBearerAuthProvider(TOKEN),
 )
 
@@ -130,80 +209,708 @@ mcp = FastMCP(
 async def validate() -> str:
     return MY_NUMBER
 
-# --- Tool: job_finder (now smart!) ---
-# JobFinderDescription = RichToolDescription(
-#     description="Smart job tool: analyze descriptions, fetch URLs, or search jobs based on free text.",
-#     use_when="Use this to evaluate job descriptions or search for jobs using freeform goals.",
-#     side_effects="Returns insights, fetched job descriptions, or relevant job links.",
-# )
 
-# @mcp.tool(description=JobFinderDescription.model_dump_json())
-# async def job_finder(
-#     user_goal: Annotated[str, Field(description="The user's goal (can be a description, intent, or freeform query)")],
-#     job_description: Annotated[str | None, Field(description="Full job description text, if available.")] = None,
-#     job_url: Annotated[AnyUrl | None, Field(description="A URL to fetch a job description from.")] = None,
-#     raw: Annotated[bool, Field(description="Return raw HTML content if True")] = False,
-# ) -> str:
-#     """
-#     Handles multiple job discovery methods: direct description, URL fetch, or freeform search query.
-#     """
-#     if job_description:
-#         return (
-#             f"📝 **Job Description Analysis**\n\n"
-#             f"---\n{job_description.strip()}\n---\n\n"
-#             f"User Goal: **{user_goal}**\n\n"
-#             f"💡 Suggestions:\n- Tailor your resume.\n- Evaluate skill match.\n- Consider applying if relevant."
-#         )
+###############################################
+# Type-to-Talk: quiz, profiles, matching, rooms
+###############################################
 
-#     if job_url:
-#         content, _ = await Fetch.fetch_url(str(job_url), Fetch.USER_AGENT, force_raw=raw)
-#         return (
-#             f"🔗 **Fetched Job Posting from URL**: {job_url}\n\n"
-#             f"---\n{content.strip()}\n---\n\n"
-#             f"User Goal: **{user_goal}**"
-#         )
-
-#     if "look for" in user_goal.lower() or "find" in user_goal.lower():
-#         links = await Fetch.google_search_links(user_goal)
-#         return (
-#             f"🔍 **Search Results for**: _{user_goal}_\n\n" +
-#             "\n".join(f"- {link}" for link in links)
-#         )
-
-#     raise McpError(ErrorData(code=INVALID_PARAMS, message="Please provide either a job description, a job URL, or a search query in user_goal."))
+# In-memory stores for demo purposes
+USERS_QUIZ: dict[str, dict] = {}
+USERS_PROFILE: dict[str, dict] = {}
+ROOMS: dict[str, dict] = {}
+USER_COUNTERPART_TYPE: dict[str, str] = {}
 
 
-# Image inputs and sending images
+def _normalize_mbti_type(t: str) -> str:
+    t = (t or "").upper().strip()
+    if len(t) != 4:
+        return t
+    # Replace any non-EI/SN/TF/JP with 'X'
+    slots = [
+        t[0] if t[0] in ("E", "I") else "X",
+        t[1] if t[1] in ("S", "N") else "X",
+        t[2] if t[2] in ("T", "F") else "X",
+        t[3] if t[3] in ("J", "P") else "X",
+    ]
+    return "".join(slots)
 
-# MAKE_IMG_BLACK_AND_WHITE_DESCRIPTION = RichToolDescription(
-#     description="Convert an image to black and white and save it.",
-#     use_when="Use this tool when the user provides an image URL and requests it to be converted to black and white.",
-#     side_effects="The image will be processed and saved in a black and white format.",
-# )
 
-# @mcp.tool(description=MAKE_IMG_BLACK_AND_WHITE_DESCRIPTION.model_dump_json())
-# async def make_img_black_and_white(
-#     puch_image_data: Annotated[str, Field(description="Base64-encoded image data to convert to black and white")] = None,
-# ) -> list[TextContent | ImageContent]:
-#     import base64
-#     import io
+def _derive_mbti_from_axis(axis_scores: dict[str, float]) -> str:
+    def pick(axis: str, pos: str, neg: str) -> str:
+        val = axis_scores.get(axis, 0.0)
+        if val > 0:
+            return pos
+        if val < 0:
+            return neg
+        return "X"
 
-#     from PIL import Image
+    return (
+        pick("EI", "E", "I")
+        + pick("SN", "S", "N")
+        + pick("TF", "T", "F")
+        + pick("JP", "J", "P")
+    )
 
-#     try:
-#         image_bytes = base64.b64decode(puch_image_data)
-#         image = Image.open(io.BytesIO(image_bytes))
 
-#         bw_image = image.convert("L")
+def _confidence_by_axis(
+    responses: list[dict],
+) -> tuple[dict[str, float], dict[str, float]]:
+    # returns (confidence_by_axis, sums_by_axis)
+    sums: dict[str, float] = {"EI": 0.0, "SN": 0.0, "TF": 0.0, "JP": 0.0}
+    totals: dict[str, float] = {"EI": 0.0, "SN": 0.0, "TF": 0.0, "JP": 0.0}
+    for r in responses or []:
+        axis = str(r.get("axis", "")).upper()
+        try:
+            value = float(r.get("value"))
+        except Exception:
+            continue
+        if axis in sums:
+            sums[axis] += value
+            totals[axis] += abs(value)
+    conf: dict[str, float] = {}
+    for k in sums:
+        max_possible = totals[k] if totals[k] > 0 else 1.0
+        conf[k] = min(1.0, abs(sums[k]) / max_possible)
+    return conf, sums
 
-#         buf = io.BytesIO()
-#         bw_image.save(buf, format="PNG")
-#         bw_bytes = buf.getvalue()
-#         bw_base64 = base64.b64encode(bw_bytes).decode("utf-8")
 
-#         return [ImageContent(type="image", mimeType="image/png", data=bw_base64)]
-#     except Exception as e:
-#         raise McpError(ErrorData(code=INTERNAL_ERROR, message=str(e)))
+GenerateQuizDescription = RichToolDescription(
+    description=(
+        "Generate a short MBTI-style 16-type questionnaire. Returns questions with axis and positive_pole plus a standard Likert scale mapping (-3..3)."
+    ),
+    use_when="User needs a ready-to-ask quiz to compute type with submit_quiz.",
+    side_effects=None,
+)
+
+
+def _question_bank(axis: str, variant: str) -> list[dict]:
+    v = variant.lower().strip() if variant else "general"
+
+    def item(prompt: str, pole: str) -> dict:
+        return {"prompt": prompt, "positive_pole": pole}
+
+    if axis == "EI":
+        general = [
+            item("I feel energized by group conversations.", "E"),
+            item("I prefer to process ideas internally before sharing.", "I"),
+            item("I enjoy meeting new people spontaneously.", "E"),
+            item("Long social gatherings tend to drain me.", "I"),
+            item("I speak to think; talking helps me clarify ideas.", "E"),
+            item("I think to speak; I prefer to form thoughts before sharing.", "I"),
+        ]
+        work = [
+            item("Team huddles energize me more than solo work blocks.", "E"),
+            item("I do my best work with minimal interruptions.", "I"),
+        ]
+        social = [
+            item("I often start conversations with strangers.", "E"),
+            item("I prefer a few close friends over many acquaintances.", "I"),
+        ]
+        return general + (work if v == "work" else social if v == "social" else [])
+
+    if axis == "SN":
+        general = [
+            item("I focus on concrete facts more than possibilities.", "S"),
+            item("I enjoy spotting patterns and future implications.", "N"),
+            item("I prefer step-by-step instructions over broad goals.", "S"),
+            item("I like exploring unconventional ideas before details.", "N"),
+            item("I trust what I can observe and verify directly.", "S"),
+            item("I’m drawn to what could be rather than what is.", "N"),
+        ]
+        work = [
+            item("I want requirements spelled out precisely.", "S"),
+            item("I enjoy proposing novel product directions.", "N"),
+        ]
+        social = [
+            item("I prefer practical advice to theory in discussions.", "S"),
+            item("I like conversations that explore big-picture themes.", "N"),
+        ]
+        return general + (work if v == "work" else social if v == "social" else [])
+
+    if axis == "TF":
+        general = [
+            item("I make decisions by weighing logic and consistency.", "T"),
+            item("I consider people and values before logic.", "F"),
+            item("Direct, candid feedback is most useful to me.", "T"),
+            item("Maintaining harmony matters more than being right.", "F"),
+            item("I evaluate pros and cons to reach an objective choice.", "T"),
+            item("I ask how decisions will feel to those affected.", "F"),
+        ]
+        work = [
+            item("I prefer performance data over sentiment in reviews.", "T"),
+            item("I prioritize team morale when choosing tradeoffs.", "F"),
+        ]
+        social = [
+            item("I value constructive critique even if it stings.", "T"),
+            item("I tailor my words to protect people’s feelings.", "F"),
+        ]
+        return general + (work if v == "work" else social if v == "social" else [])
+
+    if axis == "JP":
+        general = [
+            item("I prefer clear plans and closure.", "J"),
+            item("I like to keep options open and adapt as I go.", "P"),
+            item("I feel comfortable with set deadlines.", "J"),
+            item("I work best with flexible timelines.", "P"),
+            item("I’m motivated by checklists and finishing tasks.", "J"),
+            item("I’m energized by exploring rather than finishing.", "P"),
+        ]
+        work = [
+            item("I want decisions documented and owners assigned.", "J"),
+            item("I prefer iterative plans that can change weekly.", "P"),
+        ]
+        social = [
+            item("I plan trips well in advance.", "J"),
+            item("I enjoy spontaneous plans with friends.", "P"),
+        ]
+        return general + (work if v == "work" else social if v == "social" else [])
+
+    return []
+
+
+@mcp.tool(description=GenerateQuizDescription.model_dump_json())
+async def generate_quiz(
+    num_per_axis: Annotated[
+        int, Field(description="Number of items per axis; typical 3-5.")
+    ] = 4,
+    variant: Annotated[
+        str, Field(description="Question context: general | work | social.")
+    ] = "general",
+) -> str:
+    num = max(2, min(8, int(num_per_axis)))
+    axes = ["EI", "SN", "TF", "JP"]
+    questions: list[dict] = []
+    for axis in axes:
+        bank = _question_bank(axis, variant)
+        if not bank:
+            continue
+        slice_items = bank[:num]
+        for idx, itm in enumerate(slice_items, start=1):
+            questions.append(
+                {
+                    "id": f"{axis}-{idx}",
+                    "axis": axis,
+                    "prompt": itm["prompt"],
+                    "positive_pole": itm["positive_pole"],
+                }
+            )
+
+    payload = {
+        "version": "1.0",
+        "variant": variant,
+        "scale": {
+            "labels": [
+                "Strongly disagree",
+                "Disagree",
+                "Slightly disagree",
+                "Neutral",
+                "Slightly agree",
+                "Agree",
+                "Strongly agree",
+            ],
+            "values": [-3, -2, -1, 0, 1, 2, 3],
+            "note": "Map answers to -3..3; positive values mean stronger alignment with the question's positive_pole.",
+        },
+        "instructions": "Answer quickly with your first instinct. There are no right or wrong answers.",
+        "questions": questions,
+    }
+    return json.dumps(payload)
+
+
+SubmitQuizDescription = RichToolDescription(
+    description=(
+        "Submit a short 16-type quiz. Each response item should include axis in {EI,SN,TF,JP} and a numeric value [-3..3]."
+        " Returns {type, confidence_by_axis}. Also stores the result for the given user_id."
+    ),
+    use_when="User has completed a brief MBTI-style quiz and you need to compute their type and confidence.",
+    side_effects="Stores quiz result in memory for matching.",
+)
+
+
+@mcp.tool(description=SubmitQuizDescription.model_dump_json())
+async def submit_quiz(
+    user_id: Annotated[
+        str, Field(description="Unique ID of the user submitting the quiz.")
+    ],
+    responses: Annotated[
+        list[dict],
+        Field(
+            description="Array of {axis, value} objects. axis in {EI,SN,TF,JP}; value -3..3."
+        ),
+    ],
+) -> str:
+    if not user_id:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="user_id is required"))
+    if not isinstance(responses, list) or len(responses) == 0:
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS,
+                message="responses[] is required and must be non-empty",
+            )
+        )
+
+    confidence, sums = _confidence_by_axis(responses)
+    mbti = _derive_mbti_from_axis(sums)
+
+    USERS_QUIZ[user_id] = {
+        "type": mbti,
+        "confidence_by_axis": confidence,
+        "axis_sums": sums,
+    }
+
+    return json.dumps(
+        {
+            "type": mbti,
+            "confidence_by_axis": confidence,
+        }
+    )
+
+
+SaveProfileDescription = RichToolDescription(
+    description=(
+        "Save user profile preferences for matching. Expects availability windows, topics, and intent."
+        " Will also save user type; if omitted, will use last quiz result."
+    ),
+    use_when="User sets or updates preferences before matching.",
+    side_effects="Stores/updates profile in memory.",
+)
+
+
+@mcp.tool(description=SaveProfileDescription.model_dump_json())
+async def save_profile(
+    user_id: Annotated[str, Field(description="User ID to save profile for.")],
+    type: Annotated[
+        str | None,
+        Field(description="MBTI type like INTJ; optional if quiz was submitted."),
+    ] = None,
+    preferences: Annotated[
+        dict | None,
+        Field(
+            description="{availability:[{day,start,end,tz?}], topics:[string], intent:string}"
+        ),
+    ] = None,
+) -> str:
+    if not user_id:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="user_id is required"))
+
+    quiz_type = USERS_QUIZ.get(user_id, {}).get("type")
+    final_type = _normalize_mbti_type(type or quiz_type or "XXXX")
+
+    prefs = preferences or {}
+    # normalize
+    avail = prefs.get("availability") or []
+    topics = prefs.get("topics") or []
+    intent = (prefs.get("intent") or "casual_chat").lower()
+
+    USERS_PROFILE[user_id] = {
+        "user_id": user_id,
+        "type": final_type,
+        "availability": avail,
+        "topics": topics,
+        "intent": intent,
+    }
+
+    return json.dumps({"ok": True, "type": final_type})
+
+
+def _availability_overlap(a: list[dict], b: list[dict]) -> tuple[bool, str | None]:
+    # naive overlap: same day string and time window intersection
+    def parse_time(hm: str) -> tuple[int, int]:
+        try:
+            hh, mm = hm.split(":")
+            return int(hh), int(mm)
+        except Exception:
+            return 0, 0
+
+    for wa in a or []:
+        day_a = str(wa.get("day", "")).strip().lower()
+        sa = str(wa.get("start", "00:00"))
+        ea = str(wa.get("end", "00:00"))
+        for wb in b or []:
+            day_b = str(wb.get("day", "")).strip().lower()
+            if day_a and day_a == day_b:
+                ah, am = parse_time(sa)
+                bh, bm = parse_time(wb.get("start", "00:00"))
+                aeh, aem = parse_time(ea)
+                beh, bem = parse_time(wb.get("end", "00:00"))
+                start_a = ah * 60 + am
+                end_a = aeh * 60 + aem
+                start_b = bh * 60 + bm
+                end_b = beh * 60 + bem
+                start = max(start_a, start_b)
+                end = min(end_a, end_b)
+                if end > start:
+                    # format overlap window hh:mm-hh:mm
+                    sh, sm = divmod(start, 60)
+                    eh, em = divmod(end, 60)
+                    return True, f"{day_a.title()} {sh:02d}:{sm:02d}-{eh:02d}:{em:02d}"
+    return False, None
+
+
+def _type_fit_score(t1: str, t2: str, c1: dict | None, c2: dict | None) -> float:
+    t1 = _normalize_mbti_type(t1)
+    t2 = _normalize_mbti_type(t2)
+    axes = [
+        (0, "EI", ("E", "I")),
+        (1, "SN", ("S", "N")),
+        (2, "TF", ("T", "F")),
+        (3, "JP", ("J", "P")),
+    ]
+    score = 0.0
+    for idx, axis, (pos, neg) in axes:
+        a = t1[idx] if len(t1) == 4 else "X"
+        b = t2[idx] if len(t2) == 4 else "X"
+        same = a == b and a in (pos, neg)
+        base = 1.0 if same else 0.5 if (a in (pos, neg) and b in (pos, neg)) else 0.25
+        # weight by confidence if available
+        w1 = (c1 or {}).get(axis, 1.0)
+        w2 = (c2 or {}).get(axis, 1.0)
+        weight = (w1 + w2) / 2.0
+        score += base * weight
+    # max per axis ~1 -> total up to ~4
+    return score
+
+
+def _rationale_for_pair(u1: dict, u2: dict, overlap_str: str | None) -> str:
+    shared_topics = sorted(set(u1.get("topics", [])) & set(u2.get("topics", [])))
+    topic_part = (
+        f"shared interests in {', '.join(shared_topics[:3])}"
+        if shared_topics
+        else "complementary interests"
+    )
+    type_part = f"type fit {u1.get('type','XXXX')} × {u2.get('type','XXXX')}"
+    time_part = f"time overlap {overlap_str}" if overlap_str else "no immediate overlap"
+    intent_part = (
+        "similar intent"
+        if u1.get("intent") == u2.get("intent")
+        else "compatible intents"
+    )
+    return f"Matched due to {topic_part}, {type_part}, {intent_part}, and {time_part}."
+
+
+FindMatchesDescription = RichToolDescription(
+    description=(
+        "Find best match candidates for a user. Returns a list of {match_id, user_id, type, score, rationale}."
+    ),
+    use_when="You need to propose conversation partners after quiz/profile save.",
+    side_effects=None,
+)
+
+
+@mcp.tool(description=FindMatchesDescription.model_dump_json())
+async def find_matches(
+    user_id: Annotated[str, Field(description="The user to find matches for.")],
+    limit: Annotated[int, Field(description="Max number of candidates to return.")] = 5,
+) -> str:
+    if user_id not in USERS_PROFILE:
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS,
+                message="save_profile must be called before find_matches",
+            )
+        )
+
+    me = USERS_PROFILE[user_id]
+    my_conf = USERS_QUIZ.get(user_id, {}).get("confidence_by_axis")
+    candidates: list[dict] = []
+    for other_id, prof in USERS_PROFILE.items():
+        if other_id == user_id:
+            continue
+        conf = USERS_QUIZ.get(other_id, {}).get("confidence_by_axis")
+        type_score = _type_fit_score(
+            me.get("type", "XXXX"), prof.get("type", "XXXX"), my_conf, conf
+        )
+        # 0..4 -> scale to 0..60
+        type_score_scaled = (type_score / 4.0) * 60.0
+        # topics overlap
+        shared_topics = len(set(me.get("topics", [])) & set(prof.get("topics", [])))
+        topic_score = min(20.0, shared_topics * 7.0)
+        # intent
+        intent_score = 10.0 if me.get("intent") == prof.get("intent") else 5.0
+        # availability
+        has_overlap, overlap_str = _availability_overlap(
+            me.get("availability", []), prof.get("availability", [])
+        )
+        avail_score = 10.0 if has_overlap else 0.0
+
+        total = round(type_score_scaled + topic_score + intent_score + avail_score, 2)
+        rationale = _rationale_for_pair(me, prof, overlap_str)
+        match_id = f"{user_id}|{other_id}"
+        candidates.append(
+            {
+                "match_id": match_id,
+                "user_id": other_id,
+                "type": prof.get("type", "XXXX"),
+                "score": total,
+                "rationale": rationale,
+            }
+        )
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return json.dumps(candidates[: max(1, int(limit))])
+
+
+def _generate_starter_prompts(
+    type1: str, type2: str, shared_topics: list[str]
+) -> list[str]:
+    topics_str = (
+        ", ".join(shared_topics[:3])
+        if shared_topics
+        else "interests you both care about"
+    )
+    return [
+        f"Share a recent win and a challenge; ask how an {type2} would approach the challenge.",
+        f"Pick one topic from {topics_str} and swap a 2-minute story each.",
+        f"Plan a tiny collaboration (15 min) that leverages {type1}'s strengths with {type2}'s style.",
+    ]
+
+
+CreateRoomDescription = RichToolDescription(
+    description=(
+        "Create a private room for a proposed match_id of the form 'userA|userB'. Returns {room_id, tokens, expires_at, starter_prompts}."
+    ),
+    use_when="User selects a candidate and wants to start a private conversation.",
+    side_effects="Creates an in-memory room and ephemeral tokens (demo only).",
+)
+
+from datetime import datetime, timedelta, timezone
+import secrets
+
+
+@mcp.tool(description=CreateRoomDescription.model_dump_json())
+async def create_room(
+    match_id: Annotated[
+        str,
+        Field(description="Match identifier returned by find_matches: 'userA|userB'."),
+    ],
+) -> str:
+    try:
+        user_a, user_b = match_id.split("|", 1)
+    except ValueError:
+        raise McpError(
+            ErrorData(code=INVALID_PARAMS, message="match_id must be 'userA|userB'")
+        )
+
+    if user_a not in USERS_PROFILE or user_b not in USERS_PROFILE:
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS, message="Both users must have profiles saved"
+            )
+        )
+
+    room_id = str(uuid.uuid4())
+    token_a = secrets.token_urlsafe(24)
+    token_b = secrets.token_urlsafe(24)
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+
+    u1 = USERS_PROFILE[user_a]
+    u2 = USERS_PROFILE[user_b]
+    shared_topics = sorted(set(u1.get("topics", [])) & set(u2.get("topics", [])))
+    prompts = _generate_starter_prompts(
+        u1.get("type", "XXXX"), u2.get("type", "XXXX"), shared_topics
+    )
+
+    ROOMS[room_id] = {
+        "room_id": room_id,
+        "participants": [user_a, user_b],
+        "tokens": {user_a: token_a, user_b: token_b},
+        "expires_at": expires_at,
+        "starter_prompts": prompts,
+    }
+
+    return json.dumps(
+        {
+            "room_id": room_id,
+            "tokens": {user_a: token_a, user_b: token_b},
+            "expires_at": expires_at,
+            "starter_prompts": prompts,
+        }
+    )
+
+
+###############################################
+# Diagnostics level tooling (get/set)
+###############################################
+
+DiagnosticsDescription = RichToolDescription(
+    description="Get or set diagnostics (log) level for the server.",
+    use_when="You need more or less verbose server logs during judging.",
+    side_effects="Changing level affects subsequent logs.",
+)
+
+
+@mcp.tool(description=DiagnosticsDescription.model_dump_json())
+async def diagnostics_level_get() -> str:
+    level = logging.getLevelName(logger.getEffectiveLevel())
+    return json.dumps({"level": level})
+
+
+@mcp.tool(description=DiagnosticsDescription.model_dump_json())
+async def diagnostics_level_set(
+    level: Annotated[
+        str, Field(description="One of DEBUG, INFO, WARNING, ERROR, CRITICAL.")
+    ]
+) -> str:
+    lvl = level.upper().strip()
+    if lvl not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="Invalid level"))
+    logging.getLogger().setLevel(lvl)
+    logger.setLevel(lvl)
+    return json.dumps({"ok": True, "level": lvl})
+
+
+###############################################
+# Type Coach: counterpart, tips, translate
+###############################################
+
+SetCounterpartDescription = RichToolDescription(
+    description="Set or update counterpart's MBTI type for coaching utilities.",
+    use_when="User wants tailored communication tips for a specific type.",
+    side_effects="Stores counterpart type in memory for the user.",
+)
+
+
+@mcp.tool(description=SetCounterpartDescription.model_dump_json())
+async def set_counterpart(
+    user_id: Annotated[str, Field(description="User ID setting a counterpart type.")],
+    counterpart_type: Annotated[str, Field(description="MBTI type like ESFP.")],
+) -> str:
+    if not user_id:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="user_id is required"))
+    t = _normalize_mbti_type(counterpart_type)
+    if len(t) != 4:
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS,
+                message="counterpart_type must be a 4-letter MBTI type",
+            )
+        )
+    USER_COUNTERPART_TYPE[user_id] = t
+    return json.dumps({"ok": True, "counterpart_type": t})
+
+
+def _tips_for_type(t: str, context: str) -> list[str]:
+    t = _normalize_mbti_type(t)
+    tips: list[str] = []
+    if len(t) != 4:
+        return [
+            "Be clear and respectful.",
+            "State the goal, then the key facts.",
+            "Ask one focused question to move forward.",
+        ]
+    # Axis-based micro-tips
+    if t[0] == "E":
+        tips.append("Open with energy; invite quick back-and-forth.")
+    elif t[0] == "I":
+        tips.append("Give time to think; prefer written or structured prompts.")
+
+    if t[1] == "S":
+        tips.append("Use concrete examples tied to the current situation.")
+    elif t[1] == "N":
+        tips.append("Frame the big picture and patterns before details.")
+
+    if t[2] == "T":
+        tips.append("Lead with rationale and tradeoffs, not feelings.")
+    elif t[2] == "F":
+        tips.append("Acknowledge people impact and values first.")
+
+    if t[3] == "J":
+        tips.append("Offer a clear plan and next steps.")
+    elif t[3] == "P":
+        tips.append("Give options and keep it adaptable.")
+
+    # Include the provided context to anchor suggestions
+    if context:
+        tips.append(f"Context cue: {context.strip()[:120]}")
+    return tips[:3]
+
+
+CoachTipDescription = RichToolDescription(
+    description="Return 3 tailored suggestions to communicate with a target type.",
+    use_when="User asks how to give feedback, collaborate, or resolve conflict with a type.",
+    side_effects=None,
+)
+
+
+@mcp.tool(description=CoachTipDescription.model_dump_json())
+async def coach_tip(
+    user_id: Annotated[
+        str,
+        Field(
+            description="Caller user ID. Used to look up stored counterpart type if target_type omitted."
+        ),
+    ],
+    context: Annotated[
+        str,
+        Field(
+            description="Brief description like 'give feedback about missed deadline'."
+        ),
+    ],
+    target_type: Annotated[
+        str | None,
+        Field(description="MBTI type to target; if omitted, uses set_counterpart."),
+    ] = None,
+) -> str:
+    t = target_type or USER_COUNTERPART_TYPE.get(user_id)
+    if not t:
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS,
+                message="target_type not provided and no stored counterpart; call set_counterpart first",
+            )
+        )
+    tips = _tips_for_type(t, context)
+    return json.dumps({"target_type": _normalize_mbti_type(t), "tips": tips})
+
+
+TranslateDescription = RichToolDescription(
+    description="Rewrite a message to better fit the target type's style.",
+    use_when="User wants a tone/style translator for a counterpart type.",
+    side_effects=None,
+)
+
+
+def _rewrite_for_type(message: str, t: str) -> str:
+    t = _normalize_mbti_type(t)
+    text = message.strip()
+    # Simple heuristic rewrites
+    lines: list[str] = []
+    if t[2] == "T":
+        lines.append("Goal: ")
+        lines.append("Rationale: ")
+        lines.append("Options: ")
+    if t[2] == "F":
+        lines.append("Appreciation: ")
+        lines.append("Concern: ")
+        lines.append("Request: ")
+    if t[3] == "J":
+        lines.append("Next step by (date/time): ")
+    if t[3] == "P":
+        lines.append("Open choices: ")
+
+    bullet_prefix = "- " if t[1] == "T" else "- "
+    segments = [s.strip() for s in text.split(".") if s.strip()]
+    body = "\n".join(f"{bullet_prefix}{s}." for s in segments[:4])
+    header = f"For {t}:\n"
+    scaffold = "\n".join(lines[:4])
+    return f"{header}{body}\n\n{scaffold}".strip()
+
+
+@mcp.tool(description=TranslateDescription.model_dump_json())
+async def translate(
+    message: Annotated[str, Field(description="Original message to rewrite.")],
+    target_type: Annotated[str, Field(description="MBTI type to tailor to.")],
+) -> str:
+    t = _normalize_mbti_type(target_type)
+    if len(t) != 4:
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS, message="target_type must be a 4-letter MBTI type"
+            )
+        )
+    rewritten = _rewrite_for_type(message, t)
+    return json.dumps({"target_type": t, "rewritten": rewritten})
+
 
 AnalyzeIngredientsDescription = RichToolDescription(
     description="Analyze a product label image for ingredient safety categories using Perplexity (sonar-pro). Returns JSON plus citations.",
@@ -211,15 +918,46 @@ AnalyzeIngredientsDescription = RichToolDescription(
     side_effects="Optionally stores to Firestore if configured.",
 )
 
+
 @mcp.tool(description=AnalyzeIngredientsDescription.model_dump_json())
 async def analyze_ingredients(
-    puch_image_data: Annotated[str, Field(description="Base64-encoded image data. Either raw base64 or full data URI starting with 'data:'.")],
-    mime_type: Annotated[str, Field(description="MIME type of the image if raw base64 is provided.")] = "image/jpeg",
-    user_id: Annotated[str | None, Field(description="User id to associate with the scan if storing.")] = None,
-    store: Annotated[bool, Field(description="Store scan to Firestore if configured.")] = True,
+    puch_image_data: Annotated[
+        str,
+        Field(
+            description="Base64-encoded image data. Either raw base64 or full data URI starting with 'data:'."
+        ),
+    ],
+    mime_type: Annotated[
+        str, Field(description="MIME type of the image if raw base64 is provided.")
+    ] = "image/jpeg",
+    user_id: Annotated[
+        str | None, Field(description="User id to associate with the scan if storing.")
+    ] = None,
+    store: Annotated[
+        bool, Field(description="Store scan to Firestore if configured.")
+    ] = True,
 ) -> str:
-    # Accept both raw base64 and data URI
-    image_data_uri = puch_image_data if puch_image_data.startswith("data:") else f"data:{mime_type};base64,{puch_image_data}"
+    # Validate size early to avoid memory blowups
+    b64 = _extract_b64(puch_image_data)
+    raw_size = _approx_raw_size(b64)
+    if raw_size > MAX_IMAGE_BYTES:
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS,
+                message=f"Image too large: {raw_size} bytes > max {MAX_IMAGE_BYTES} bytes",
+            )
+        )
+
+    image_data_uri = (
+        puch_image_data
+        if puch_image_data.startswith("data:")
+        else f"data:{mime_type};base64,{puch_image_data}"
+    )
+
+    request_id = str(uuid.uuid4())
+    logger.info(
+        f"[{request_id}] analyze_ingredients start user_id={user_id} size={raw_size}"
+    )
 
     prompt = """
 You are an AI assistant that analyzes food product ingredient labels for health and safety. Given a list of ingredients, categorize them into the following:
@@ -305,7 +1043,7 @@ Use this exact JSON structure:
 }
 """
 
-    payload = {
+    payload: dict = {
         "model": "sonar-pro",
         "messages": [
             {"role": "system", "content": "Be precise and concise."},
@@ -317,74 +1055,66 @@ Use this exact JSON structure:
                 ],
             },
         ],
-        "web_search_options": {"search_context_size": "medium"}
     }
+
+    if os.getenv("PERPLEXITY_WEB_SEARCH", "false").lower() in ("1", "true", "yes"):
+        payload["web_search_options"] = {"search_context_size": "medium"}
+
+    if not PERPLEXITY_API_KEY:
+        raise McpError(
+            ErrorData(
+                code=INTERNAL_ERROR,
+                message="Perplexity API key not configured on this server",
+            )
+        )
 
     headers = {
         "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
         "accept": "application/json",
         "content-type": "application/json",
+        "X-Request-ID": request_id,
     }
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            data = ""
-            resp = await client.post("https://api.perplexity.ai/chat/completions", headers=headers, json=payload)
-            # for line in resp.iter_lines():
-            #     if line:
-            #         line = line.decode('utf-8')
-            #         if line.startswith('data: '):
-            #             data_str = line[6:]  # Remove 'data: ' prefix
-            #             if data_str == '[DONE]':
-            #                 break
-            #             try:
-            #                 chunk_data = json.loads(data_str)
-            #                 content = chunk_data['choices'][0]['delta'].get('content', '')
-            #                 if content:
-            #                     data += content
-            #             except json.JSONDecodeError:
-            #                 continue
+        async with _PERPLEXITY_SEMAPHORE:
+            resp = await _post_with_retries(
+                "https://api.perplexity.ai/chat/completions",
+                headers=headers,
+                payload=payload,
+                attempts=3,
+            )
 
         if resp.status_code >= 400:
-            raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Perplexity error {resp.status_code}: {resp.text[:300]}"))
-        
+            raise McpError(
+                ErrorData(
+                    code=INTERNAL_ERROR,
+                    message=f"Perplexity error {resp.status_code}: {resp.text[:300]}",
+                )
+            )
+
         data = resp.json()
-        # print(data)
-        # analysis_content = (
-        #     data.get("choices", [{}])[0]
-        #     .get("message", {})
-        #     .get("content", "No analysis available")
-        # )
-        # result = {
-        #     "analysis": analysis_content,
-        #     "citations": data.get("citations", []),
-        # }
-
-        # if store and DB is not None:
-        #     try:
-        #         # firestore imported only if DB was initialized successfully
-        #         from firebase_admin import firestore  # type: ignore
-        #         DB.collection("scans").add({
-        #             "user_id": user_id or "unknown",
-        #             "analysis_result": data,
-        #             "timestamp": firestore.SERVER_TIMESTAMP,
-        #         })
-        #     except Exception:
-        #         # Non-fatal if storage fails
-        #         pass
-
+        logger.info(f"[{request_id}] analyze_ingredients ok")
         return json.dumps(data)
 
     except httpx.HTTPError as e:
+        logger.error(f"[{request_id}] network error: {e!r}")
         raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Network error: {e!r}"))
     except Exception as e:
+        logger.exception(f"[{request_id}] unexpected error")
         raise McpError(ErrorData(code=INTERNAL_ERROR, message=str(e)))
-    
+
 
 # --- Run MCP Server ---
 async def main():
-    print("🚀 Starting MCP server on http://0.0.0.0:8086")
-    await mcp.run_async("streamable-http", host="0.0.0.0", port=8086)
+    logger.info(
+        f"🚀 Starting MCP server on http://0.0.0.0:8086 (concurrency={PERPLEXITY_MAX_CONCURRENCY})"
+    )
+    try:
+        await mcp.run_async("streamable-http", host="0.0.0.0", port=8086)
+    finally:
+        await HTTP_CLIENT.aclose()
+        logger.info("HTTP client closed; shutdown complete")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
