@@ -13,6 +13,8 @@ from pydantic import BaseModel, Field, AnyUrl
 import markdownify
 import httpx
 import readabilipy
+import db
+import re
 
 import logging
 import uuid
@@ -47,6 +49,8 @@ MY_NUMBER = os.environ.get("MY_NUMBER")
 PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY")
 assert TOKEN is not None, "Please set AUTH_TOKEN in your .env file"
 assert MY_NUMBER is not None, "Please set MY_NUMBER in your .env file"
+
+                                 
 # Perplexity is optional for this server; analyze_ingredients will error if missing
 # --- Auth Provider ---
 class SimpleBearerAuthProvider(BearerAuthProvider):
@@ -214,11 +218,7 @@ async def validate() -> str:
 # Type-to-Talk: quiz, profiles, matching, rooms
 ###############################################
 
-# In-memory stores for demo purposes
-USERS_QUIZ: dict[str, dict] = {}
-USERS_PROFILE: dict[str, dict] = {}
-ROOMS: dict[str, dict] = {}
-USER_COUNTERPART_TYPE: dict[str, str] = {}
+# Persisted state is handled via Supabase through db.py helpers
 
 
 def _normalize_mbti_type(t: str) -> str:
@@ -276,9 +276,10 @@ def _confidence_by_axis(
 
 GenerateQuizDescription = RichToolDescription(
     description=(
-        "Generate a short MBTI-style 16-type questionnaire. Returns questions with axis and positive_pole plus a standard Likert scale mapping (-3..3)."
+       "Generate a short MBTI-style 16-type questionnaire. Present ALL questions at once, "
+        "collect '{1a 2b ...}', then call submit_quiz_compact(user_id, quiz_json, answers_compact)."
     ),
-    use_when="User needs a ready-to-ask quiz to compute type with submit_quiz.",
+    use_when="User needs a ready-to-ask quiz to compute type with submit_quiz_compact.",
     side_effects=None,
 )
 
@@ -411,10 +412,74 @@ async def generate_quiz(
             "values": [-3, -2, -1, 0, 1, 2, 3],
             "note": "Map answers to -3..3; positive values mean stronger alignment with the question's positive_pole.",
         },
-        "instructions": "Answer quickly with your first instinct. There are no right or wrong answers.",
+        "instructions": (
+        "Present ALL questions at once. Ask the user to reply with a compact string like "
+        "'{1a 2b 3c ...}'. Supported: a..d -> -3,-1,1,3 or a..g -> -3..3. "
+        "After collecting, call submit_quiz_compact(user_id, quiz_json=<this payload>, answers_compact='{...}')."),
         "questions": questions,
     }
     return json.dumps(payload)
+
+SubmitQuizCompactDescription = RichToolDescription(
+    description=(
+        "Submit compact quiz answers in one call. Provide the raw JSON from generate_quiz as quiz_json, "
+        "and a compact string like '{1a 2b 3c ...}'. Letters a..d map to -3,-1,1,3; a..g map to -3..3. "
+        "If a question's positive_pole is I/N/F/P, the server inverts the sign so E/S/T/J are positive."
+    ),
+    use_when="You have a compact single-string response for the entire quiz.",
+    side_effects="Stores quiz result to DB for matching.",
+)
+
+@mcp.tool(description=SubmitQuizCompactDescription.model_dump_json())
+async def submit_quiz_compact(
+    user_id: Annotated[str, Field(description="Unique ID of the user submitting the quiz.")],
+    quiz_json: Annotated[str, Field(description="The exact JSON string returned by generate_quiz.")],
+    answers_compact: Annotated[str, Field(description="Compact response string like '{1a 2b 3c ...}'.")],
+) -> str:
+    if not user_id:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="user_id is required"))
+    try:
+        quiz = json.loads(quiz_json)
+    except Exception:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="quiz_json must be valid JSON from generate_quiz"))
+    questions = quiz.get("questions") or []
+    if not isinstance(questions, list) or not questions:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="quiz_json missing questions"))
+
+    tokens = re.findall(r"(\\d+)\\s*([a-gA-G])", answers_compact or "")
+    if not tokens:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="answers_compact must contain entries like '1a 2d'"))
+
+    # Support both 4- and 7-choice inputs
+    map7 = {"a": -3, "b": -2, "c": -1, "d": 0, "e": 1, "f": 2, "g": 3}
+    map4 = {"a": -3, "b": -1, "c": 1, "d": 3}
+    POS_FOR_AXIS = {"EI": "E", "SN": "S", "TF": "T", "JP": "J"}
+
+    def letter_value(ch: str) -> float | None:
+        ch = ch.lower()
+        return map7.get(ch, map4.get(ch))
+
+    responses: list[dict] = []
+    for idx_str, ch in tokens:
+        i = int(idx_str) - 1
+        if i < 0 or i >= len(questions):
+            continue
+        q = questions[i]
+        v = letter_value(ch)
+        if v is None:
+            continue
+        axis = q.get("axis")
+        pole = q.get("positive_pole")
+        # Ensure E/S/T/J are positive overall
+        if axis in POS_FOR_AXIS and pole and pole != POS_FOR_AXIS[axis]:
+            v = -v
+        responses.append({"axis": axis, "value": float(v)})
+
+    if not responses:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="No valid responses parsed"))
+
+    # Reuse existing flow (validates, stores, returns {type, confidence_by_axis})
+    return await submit_quiz(user_id=user_id, responses=responses)
 
 
 SubmitQuizDescription = RichToolDescription(
@@ -423,11 +488,11 @@ SubmitQuizDescription = RichToolDescription(
         " Returns {type, confidence_by_axis}. Also stores the result for the given user_id."
     ),
     use_when="User has completed a brief MBTI-style quiz and you need to compute their type and confidence.",
-    side_effects="Stores quiz result in memory for matching.",
+    side_effects="Stores quiz result to DB for matching.",
 )
 
 
-@mcp.tool(description=SubmitQuizDescription.model_dump_json())
+# @mcp.tool(description=SubmitQuizDescription.model_dump_json())
 async def submit_quiz(
     user_id: Annotated[
         str, Field(description="Unique ID of the user submitting the quiz.")
@@ -451,19 +516,22 @@ async def submit_quiz(
 
     confidence, sums = _confidence_by_axis(responses)
     mbti = _derive_mbti_from_axis(sums)
+    try:
+        await db.upsert_users_quiz(
+            HTTP_CLIENT,
+            user_id=user_id,
+            mbti=mbti,
+            confidence_by_axis=confidence,
+            axis_sums=sums,
+        )
+        logger.info(f"[submit_quiz] upsert users_quiz ok user_id={user_id}")
+    except (httpx.HTTPError, RuntimeError) as e:
+        logger.error(f"[submit_quiz] users_quiz error user_id={user_id} err={e!r}")
+        raise McpError(
+            ErrorData(code=INTERNAL_ERROR, message=f"Failed to store quiz: {e!r}")
+        )
 
-    USERS_QUIZ[user_id] = {
-        "type": mbti,
-        "confidence_by_axis": confidence,
-        "axis_sums": sums,
-    }
-
-    return json.dumps(
-        {
-            "type": mbti,
-            "confidence_by_axis": confidence,
-        }
-    )
+    return json.dumps({"type": mbti, "confidence_by_axis": confidence})
 
 
 SaveProfileDescription = RichToolDescription(
@@ -472,7 +540,7 @@ SaveProfileDescription = RichToolDescription(
         " Will also save user type; if omitted, will use last quiz result."
     ),
     use_when="User sets or updates preferences before matching.",
-    side_effects="Stores/updates profile in memory.",
+    side_effects="Stores/updates profile in DB.",
 )
 
 
@@ -486,14 +554,22 @@ async def save_profile(
     preferences: Annotated[
         dict | None,
         Field(
-            description="{availability:[{day,start,end,tz?}], topics:[string], intent:string}"
+            description="{availability:[{day,start,end,tz?}], topics:[string], intent:string, is_looking:boolean}"
         ),
     ] = None,
 ) -> str:
     if not user_id:
         raise McpError(ErrorData(code=INVALID_PARAMS, message="user_id is required"))
 
-    quiz_type = USERS_QUIZ.get(user_id, {}).get("type")
+    # determine type: explicit param, else last quiz type from DB, else XXXX
+    quiz_type: str | None = None
+    try:
+        rows = await db.get_users_quiz_by_ids(HTTP_CLIENT, [user_id])
+        if rows:
+            quiz_type = (rows[0] or {}).get("type")
+    except (httpx.HTTPError, RuntimeError) as e:
+        logger.error(f"[save_profile] read users_quiz error user_id={user_id} err={e!r}")
+        # continue with fallback
     final_type = _normalize_mbti_type(type or quiz_type or "XXXX")
 
     prefs = preferences or {}
@@ -501,14 +577,30 @@ async def save_profile(
     avail = prefs.get("availability") or []
     topics = prefs.get("topics") or []
     intent = (prefs.get("intent") or "casual_chat").lower()
+    is_looking_val = prefs.get("is_looking")
+    if isinstance(is_looking_val, str):
+        is_looking = is_looking_val.lower() in ("1", "true", "yes", "on")
+    elif is_looking_val is None:
+        is_looking = False
+    else:
+        is_looking = bool(is_looking_val)
 
-    USERS_PROFILE[user_id] = {
-        "user_id": user_id,
-        "type": final_type,
-        "availability": avail,
-        "topics": topics,
-        "intent": intent,
-    }
+    try:
+        await db.upsert_users_profile(
+            HTTP_CLIENT,
+            user_id=user_id,
+            type_=final_type,
+            availability=avail,
+            topics=topics,
+            intent=intent,
+            is_looking=is_looking,
+        )
+        logger.info(f"[save_profile] upsert users_profile ok user_id={user_id}")
+    except (httpx.HTTPError, RuntimeError) as e:
+        logger.error(f"[save_profile] users_profile error user_id={user_id} err={e!r}")
+        raise McpError(
+            ErrorData(code=INTERNAL_ERROR, message=f"Failed to save profile: {e!r}")
+        )
 
     return json.dumps({"ok": True, "type": final_type})
 
@@ -602,7 +694,15 @@ async def find_matches(
     user_id: Annotated[str, Field(description="The user to find matches for.")],
     limit: Annotated[int, Field(description="Max number of candidates to return.")] = 5,
 ) -> str:
-    if user_id not in USERS_PROFILE:
+    try:
+        me = await db.get_user_profile(HTTP_CLIENT, user_id)
+    except (httpx.HTTPError, RuntimeError) as e:
+        logger.error(f"[find_matches] read users_profile error user_id={user_id} err={e!r}")
+        raise McpError(
+            ErrorData(code=INTERNAL_ERROR, message=f"Failed to load profile: {e!r}")
+        )
+
+    if not me:
         raise McpError(
             ErrorData(
                 code=INVALID_PARAMS,
@@ -610,24 +710,46 @@ async def find_matches(
             )
         )
 
-    me = USERS_PROFILE[user_id]
-    my_conf = USERS_QUIZ.get(user_id, {}).get("confidence_by_axis")
+    if not (me.get("is_looking") is True):
+        return json.dumps([])
+
+    try:
+        all_profiles = await db.get_all_profiles(HTTP_CLIENT)
+    except (httpx.HTTPError, RuntimeError) as e:
+        logger.error(f"[find_matches] list profiles error user_id={user_id} err={e!r}")
+        raise McpError(
+            ErrorData(code=INTERNAL_ERROR, message=f"Failed to load profiles: {e!r}")
+        )
+
+    others = [
+        p for p in all_profiles
+        if (p or {}).get("user_id") != user_id and (p or {}).get("is_looking") is True
+    ]
+
+    # fetch quiz confidences for me and others in one call
+    ids = [user_id] + [p.get("user_id") for p in others]
+    quiz_map: dict[str, dict] = {}
+    try:
+        quiz_rows = await db.get_users_quiz_by_ids(HTTP_CLIENT, ids)
+        for row in quiz_rows:
+            if row and "user_id" in row:
+                quiz_map[row["user_id"]] = row.get("confidence_by_axis") or {}
+    except (httpx.HTTPError, RuntimeError) as e:
+        logger.error(f"[find_matches] read users_quiz error user_id={user_id} err={e!r}")
+        # proceed without confidences
+
+    my_conf = quiz_map.get(user_id)
     candidates: list[dict] = []
-    for other_id, prof in USERS_PROFILE.items():
-        if other_id == user_id:
-            continue
-        conf = USERS_QUIZ.get(other_id, {}).get("confidence_by_axis")
+    for prof in others:
+        other_id = prof.get("user_id")
+        conf = quiz_map.get(other_id)
         type_score = _type_fit_score(
             me.get("type", "XXXX"), prof.get("type", "XXXX"), my_conf, conf
         )
-        # 0..4 -> scale to 0..60
         type_score_scaled = (type_score / 4.0) * 60.0
-        # topics overlap
         shared_topics = len(set(me.get("topics", [])) & set(prof.get("topics", [])))
         topic_score = min(20.0, shared_topics * 7.0)
-        # intent
         intent_score = 10.0 if me.get("intent") == prof.get("intent") else 5.0
-        # availability
         has_overlap, overlap_str = _availability_overlap(
             me.get("availability", []), prof.get("availability", [])
         )
@@ -670,7 +792,7 @@ CreateRoomDescription = RichToolDescription(
         "Create a private room for a proposed match_id of the form 'userA|userB'. Returns {room_id, tokens, expires_at, starter_prompts}."
     ),
     use_when="User selects a candidate and wants to start a private conversation.",
-    side_effects="Creates an in-memory room and ephemeral tokens (demo only).",
+    side_effects="Creates a DB room and ephemeral tokens.",
 )
 
 from datetime import datetime, timedelta, timezone
@@ -691,41 +813,59 @@ async def create_room(
             ErrorData(code=INVALID_PARAMS, message="match_id must be 'userA|userB'")
         )
 
-    if user_a not in USERS_PROFILE or user_b not in USERS_PROFILE:
+    try:
+        u1 = await db.get_user_profile(HTTP_CLIENT, user_a)
+        u2 = await db.get_user_profile(HTTP_CLIENT, user_b)
+    except (httpx.HTTPError, RuntimeError) as e:
+        logger.error(f"[create_room] load profiles error match_id={match_id} err={e!r}")
+        raise McpError(
+            ErrorData(code=INTERNAL_ERROR, message=f"Failed to load profiles: {e!r}")
+        )
+
+    if not u1 or not u2:
         raise McpError(
             ErrorData(
                 code=INVALID_PARAMS, message="Both users must have profiles saved"
             )
         )
 
-    room_id = str(uuid.uuid4())
+    if not (u1.get("is_looking") is True and u2.get("is_looking") is True):
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS,
+                message="Both users must be actively looking for matches to create a room",
+            )
+        )
+
     token_a = secrets.token_urlsafe(24)
     token_b = secrets.token_urlsafe(24)
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
-
-    u1 = USERS_PROFILE[user_a]
-    u2 = USERS_PROFILE[user_b]
     shared_topics = sorted(set(u1.get("topics", [])) & set(u2.get("topics", [])))
     prompts = _generate_starter_prompts(
         u1.get("type", "XXXX"), u2.get("type", "XXXX"), shared_topics
     )
 
-    ROOMS[room_id] = {
+    try:
+        row = await db.create_room_row(
+            HTTP_CLIENT,
+            participants=[user_a, user_b],
+            tokens={user_a: token_a, user_b: token_b},
+            expires_at=expires_at,
+        )
+        room_id = str(row.get("room_id") or uuid.uuid4())
+        logger.info(f"[create_room] created rooms row room_id={room_id}")
+    except (httpx.HTTPError, RuntimeError) as e:
+        logger.error(f"[create_room] rooms error match_id={match_id} err={e!r}")
+        raise McpError(
+            ErrorData(code=INTERNAL_ERROR, message=f"Failed to create room: {e!r}")
+        )
+
+    return json.dumps({
         "room_id": room_id,
-        "participants": [user_a, user_b],
         "tokens": {user_a: token_a, user_b: token_b},
         "expires_at": expires_at,
         "starter_prompts": prompts,
-    }
-
-    return json.dumps(
-        {
-            "room_id": room_id,
-            "tokens": {user_a: token_a, user_b: token_b},
-            "expires_at": expires_at,
-            "starter_prompts": prompts,
-        }
-    )
+    })
 
 
 ###############################################
@@ -766,7 +906,7 @@ async def diagnostics_level_set(
 SetCounterpartDescription = RichToolDescription(
     description="Set or update counterpart's MBTI type for coaching utilities.",
     use_when="User wants tailored communication tips for a specific type.",
-    side_effects="Stores counterpart type in memory for the user.",
+    side_effects="Stores counterpart type in DB for the user.",
 )
 
 
@@ -785,7 +925,18 @@ async def set_counterpart(
                 message="counterpart_type must be a 4-letter MBTI type",
             )
         )
-    USER_COUNTERPART_TYPE[user_id] = t
+    try:
+        await db.upsert_counterpart(HTTP_CLIENT, user_id=user_id, counterpart_type=t)
+        logger.info(f"[set_counterpart] upsert user_counterpart_type ok user_id={user_id}")
+    except (httpx.HTTPError, RuntimeError) as e:
+        logger.error(
+            f"[set_counterpart] user_counterpart_type error user_id={user_id} err={e!r}"
+        )
+        raise McpError(
+            ErrorData(
+                code=INTERNAL_ERROR, message=f"Failed to save counterpart: {e!r}"
+            )
+        )
     return json.dumps({"ok": True, "counterpart_type": t})
 
 
@@ -851,7 +1002,19 @@ async def coach_tip(
         Field(description="MBTI type to target; if omitted, uses set_counterpart."),
     ] = None,
 ) -> str:
-    t = target_type or USER_COUNTERPART_TYPE.get(user_id)
+    t = target_type
+    if not t:
+        try:
+            t = await db.get_counterpart(HTTP_CLIENT, user_id)
+        except (httpx.HTTPError, RuntimeError) as e:
+            logger.error(
+                f"[coach_tip] read user_counterpart_type error user_id={user_id} err={e!r}"
+            )
+            raise McpError(
+                ErrorData(
+                    code=INTERNAL_ERROR, message=f"Failed to load counterpart: {e!r}"
+                )
+            )
     if not t:
         raise McpError(
             ErrorData(

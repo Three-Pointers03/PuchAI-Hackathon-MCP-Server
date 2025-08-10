@@ -61,6 +61,10 @@ AUTH_TOKEN=your_secret_token_here
 MY_NUMBER=919876543210
 # Optional for ingredients analyzer only
 # PERPLEXITY_API_KEY=...
+
+# Supabase for persistent Type‑to‑Talk state
+# SUPABASE_URL=https://<project>.supabase.co
+# SUPABASE_SERVICE_ROLE_KEY=...
 ```
 
 **Important Notes:**
@@ -93,6 +97,34 @@ docker compose logs -f
 ```
 
 The server will be available on `http://localhost:8086`.
+
+### Step 4.1: Enable Supabase (Persistent State)
+
+Type‑to‑Talk tools now persist state using Supabase (Postgres via PostgREST).
+
+1) Create a Supabase project and get:
+- `SUPABASE_URL` (e.g., `https://<project>.supabase.co`)
+- `SUPABASE_SERVICE_ROLE_KEY` (Settings → API → Service role)
+
+2) Apply schema:
+- Open Supabase SQL editor and paste the contents of `mcp-starter/supabase_schema.sql`. Run it once.
+
+3) Configure environment:
+- Add to your `.env` (or set in your deploy environment):
+  ```env
+  SUPABASE_URL=your_supabase_url
+  SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
+  ```
+
+4) Rebuild and run:
+```bash
+docker compose build
+docker compose up -d
+```
+
+Notes:
+- PostgREST is used over HTTP with the server's existing async client. No extra DB drivers required.
+- If Supabase env vars are missing, DB-backed tools will return errors.
 
 ### Step 5: Make It Public (Required by Puch)
 
@@ -166,8 +198,8 @@ Use the returned `questions` with the provided Likert scale. Then submit:
 ```
 
 Notes:
-- Matching and rooms use in-memory storage for demo; restarting clears state.
 - Ingredients analyzer requires `PERPLEXITY_API_KEY`. Type‑to‑Talk tools work without it.
+- With Supabase configured, profiles, quiz results, counterparts, matching, and rooms persist across restarts.
 
 ### Debug Mode
 
