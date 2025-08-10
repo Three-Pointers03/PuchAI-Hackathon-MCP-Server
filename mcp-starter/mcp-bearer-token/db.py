@@ -58,24 +58,39 @@ async def upsert_users_quiz(
     raw_answers: dict | list | str | None = None,
     sanitized_answers: dict | list | None = None,
 ) -> dict:
-    payload_item: dict = {
-        "user_id": user_id,
-        "type": mbti,
-        "confidence_by_axis": confidence_by_axis,
-        "axis_sums": axis_sums,
-    }
-    # Only include optional fields if provided to avoid overwriting with null
-    if raw_answers is not None:
-        payload_item["raw_answers"] = raw_answers
-    if sanitized_answers is not None:
-        payload_item["sanitized_answers"] = sanitized_answers
+    try:
+        payload_item: dict = {
+            "user_id": user_id,
+            "type": mbti,
+            "confidence_by_axis": confidence_by_axis,
+            "axis_sums": axis_sums,
+        }
+        # Only include optional fields if provided to avoid overwriting with null
+        if raw_answers is not None:
+            payload_item["raw_answers"] = raw_answers
+        if sanitized_answers is not None:
+            payload_item["sanitized_answers"] = sanitized_answers
 
-    payload = [payload_item]
-    resp = await client.post(
-        _tbl("users_quiz?on_conflict=user_id"), headers=_upsert_headers(), json=payload
-    )
-    resp.raise_for_status()
-    return resp.json()[0]
+        payload = [payload_item]
+        url = _tbl("users_quiz?on_conflict=user_id")
+        headers = _upsert_headers()
+        
+        print(f"[DEBUG] Making POST request to: {url}")
+        print(f"[DEBUG] Headers: {headers}")
+        print(f"[DEBUG] Payload: {payload}")
+        
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        result = resp.json()
+        if not result or len(result) == 0:
+            raise RuntimeError("Supabase returned empty response for upsert operation")
+        return result[0]
+    except Exception as e:
+        print(f"[DEBUG] Error in upsert_users_quiz: {e}")
+        print(f"[DEBUG] Error type: {type(e)}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 async def get_users_quiz_by_ids(

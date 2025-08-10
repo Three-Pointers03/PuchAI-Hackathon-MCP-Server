@@ -93,10 +93,8 @@ def _httpx_log_response(response: httpx.Response) -> None:
 
 
 HTTP_CLIENT = httpx.AsyncClient(
-    limits=HTTP_LIMITS,
-    timeout=HTTP_TIMEOUT,
+    timeout=45.0,
     http2=False,
-    event_hooks={"response": [_httpx_log_response]},
 )
 
 # --- Load environment variables ---
