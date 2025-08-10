@@ -67,7 +67,7 @@ MY_NUMBER=919876543210
 - `AUTH_TOKEN`: This is your secret token for authentication. Keep it safe!
 - `MY_NUMBER`: Your WhatsApp number in format `{country_code}{number}` (e.g., `919876543210` for +91-9876543210)
 
-### Step 3: Run the Server
+### Step 3: Run the Server (Local Python)
 
 ```bash
 cd mcp-bearer-token
@@ -76,7 +76,25 @@ python mcp_starter.py
 
 You'll see: `🚀 Starting MCP server on http://0.0.0.0:8086`
 
-### Step 4: Make It Public (Required by Puch)
+### Step 4: Run with Docker
+
+```bash
+cd mcp-starter
+cp .env.example .env   # then edit values
+
+# Build
+docker compose build
+
+# Run
+docker compose up -d
+
+# View logs
+docker compose logs -f
+```
+
+The server will be available on `http://localhost:8086`.
+
+### Step 5: Make It Public (Required by Puch)
 
 Since Puch needs to access your server over HTTPS, you need to expose your local server:
 

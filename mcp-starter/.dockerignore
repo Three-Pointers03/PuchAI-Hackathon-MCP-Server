@@ -1,0 +1,15 @@
+.venv
+__pycache__/
+*.pyc
+.env
+.env.*
+uv.lock
+Dockerfile
+.git
+.gitignore
+**/.mypy_cache/
+**/.pytest_cache/
+**/.ruff_cache/
+**/.DS_Store
+
+

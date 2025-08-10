@@ -1,0 +1,21 @@
+name: mcp-starter
+
+services:
+  mcp:
+    container_name: mcp-starter
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8086:8086"
+    env_file:
+      - .env
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - PERPLEXITY_MAX_CONCURRENCY=${PERPLEXITY_MAX_CONCURRENCY:-4}
+      - HTTP_MAX_CONNECTIONS=${HTTP_MAX_CONNECTIONS:-100}
+      - HTTP_MAX_KEEPALIVE=${HTTP_MAX_KEEPALIVE:-20}
+      - MAX_IMAGE_BYTES=${MAX_IMAGE_BYTES:-5242880}
+    restart: unless-stopped
+
+
