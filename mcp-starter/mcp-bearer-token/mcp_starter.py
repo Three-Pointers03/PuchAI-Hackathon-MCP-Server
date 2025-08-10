@@ -423,8 +423,17 @@ async def generate_quiz(
 SubmitQuizCompactDescription = RichToolDescription(
     description=(
         "Submit compact quiz answers in one call. Provide the raw JSON from generate_quiz as quiz_json, "
-        "and a compact string like '{1a 2b 3c ...}'. Letters a..d map to -3,-1,1,3; a..g map to -3..3. "
-        "If a question's positive_pole is I/N/F/P, the server inverts the sign so E/S/T/J are positive."
+        "and answers_compact as a space-separated string of question-answer pairs.\n\n"
+        "Format: '1a 2b 3c 4d 5e 6f 7g 8a 9c 10e 11b 12f 13d 14g 15a 16c'\n"
+        "- Numbers (1,2,3...) = question index (1-based)\n"
+        "- Letters map to values:\n"
+        "  * 7-choice: a=-3, b=-2, c=-1, d=0, e=1, f=2, g=3\n"
+        "  * 4-choice: a=-3, b=-1, c=1, d=3\n\n"
+        "Examples:\n"
+        "- '1a 2c 3e 4b 5f 6d 7g 8a' (8 questions)\n"
+        "- '1b 3d 5f 7a 9c 11e 13g 15b' (partial responses ok)\n"
+        "- '1g 2g 3g 4g' (all strongly agree)\n\n"
+        "Returns: JSON with 'type' (MBTI) and 'confidence_by_axis' (EI/SN/TF/JP scores 0-1)."
     ),
     use_when="You have a compact single-string response for the entire quiz.",
     side_effects="Stores quiz result to DB for matching.",
