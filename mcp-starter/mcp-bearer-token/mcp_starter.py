@@ -563,7 +563,7 @@ async def submit_quiz_compact(
 
     # Reuse existing flow (validates, stores, returns {type, confidence_by_axis})
     # Include persistence of raw and sanitized answers
-    result_json = await submit_quiz(user_id=user_id, responses=responses)
+    result_json = await _submit_quiz_internal(user_id=user_id, responses=responses)
     return result_json
 
 
@@ -577,18 +577,8 @@ SubmitQuizDescription = RichToolDescription(
 )
 
 
-@mcp.tool(description=SubmitQuizDescription.model_dump_json())
-async def submit_quiz(
-    user_id: Annotated[
-        str, Field(description="Unique ID of the user submitting the quiz.")
-    ],
-    responses: Annotated[
-        list[dict | str],
-        Field(
-            description="Array of items: either {axis, value} objects or strings like 'EI: a'. axis in {EI,SN,TF,JP}; value -3..3 or Likert text."
-        ),
-    ],
-) -> str:
+async def _submit_quiz_internal(user_id: str, responses: list[dict | str]) -> str:
+    """Internal helper function for quiz submission logic."""
     if not user_id:
         raise McpError(ErrorData(code=INVALID_PARAMS, message="user_id is required"))
     if not isinstance(responses, list) or len(responses) == 0:
