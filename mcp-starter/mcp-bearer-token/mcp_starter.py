@@ -434,7 +434,7 @@ def _question_bank(axis: str, variant: str) -> list[dict]:
     return []
 
 
-# @mcp.tool(description=GenerateQuizDescription.model_dump_json())
+@mcp.tool(description=GenerateQuizDescription.model_dump_json())
 async def generate_quiz(
     num_per_axis: Annotated[
         int, Field(description="Ignored. Always 4 per axis.")
@@ -785,94 +785,6 @@ FindMatchesDescription = RichToolDescription(
 )
 
 
-@mcp.tool(description=FindMatchesDescription.model_dump_json())
-async def find_matches(
-    user_id: Annotated[str, Field(description="The user to find matches for.")],
-    limit: Annotated[int, Field(description="Max number of candidates to return.")] = 5,
-) -> str:
-    try:
-        me = await db.get_user_profile(HTTP_CLIENT, user_id)
-    except (httpx.HTTPError, RuntimeError) as e:
-        logger.exception(
-            f"[find_matches] read users_profile error user_id={user_id}"
-        )
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Failed to load profile: {e!r}")
-        )
-
-    if not me:
-        raise McpError(
-            ErrorData(
-                code=INVALID_PARAMS,
-                message="save_profile must be called before find_matches",
-            )
-        )
-
-    if not (me.get("is_looking") is True):
-        return json.dumps([])
-
-    try:
-        all_profiles = await db.get_all_profiles(HTTP_CLIENT)
-    except (httpx.HTTPError, RuntimeError) as e:
-        logger.exception(
-            f"[find_matches] list profiles error user_id={user_id}"
-        )
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Failed to load profiles: {e!r}")
-        )
-
-    others = [
-        p for p in all_profiles
-        if (p or {}).get("user_id") != user_id and (p or {}).get("is_looking") is True
-    ]
-
-    # fetch quiz confidences for me and others in one call
-    ids = [user_id] + [p.get("user_id") for p in others]
-    quiz_map: dict[str, dict] = {}
-    try:
-        quiz_rows = await db.get_users_quiz_by_ids(HTTP_CLIENT, ids)
-        for row in quiz_rows:
-            if row and "user_id" in row:
-                quiz_map[row["user_id"]] = row.get("confidence_by_axis") or {}
-    except (httpx.HTTPError, RuntimeError) as e:
-        logger.exception(
-            f"[find_matches] read users_quiz error user_id={user_id}"
-        )
-        # proceed without confidences
-
-    my_conf = quiz_map.get(user_id)
-    candidates: list[dict] = []
-    for prof in others:
-        other_id = prof.get("user_id")
-        conf = quiz_map.get(other_id)
-        type_score = _type_fit_score(
-            me.get("type", "XXXX"), prof.get("type", "XXXX"), my_conf, conf
-        )
-        type_score_scaled = (type_score / 4.0) * 60.0
-        shared_topics = len(set(me.get("topics", [])) & set(prof.get("topics", [])))
-        topic_score = min(20.0, shared_topics * 7.0)
-        intent_score = 10.0 if me.get("intent") == prof.get("intent") else 5.0
-        has_overlap, overlap_str = _availability_overlap(
-            me.get("availability", []), prof.get("availability", [])
-        )
-        avail_score = 10.0 if has_overlap else 0.0
-
-        total = round(type_score_scaled + topic_score + intent_score + avail_score, 2)
-        rationale = _rationale_for_pair(me, prof, overlap_str)
-        match_id = f"{user_id}|{other_id}"
-        candidates.append(
-            {
-                "match_id": match_id,
-                "user_id": other_id,
-                "type": prof.get("type", "XXXX"),
-                "score": total,
-                "rationale": rationale,
-            }
-        )
-
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    return json.dumps(candidates[: max(1, int(limit))])
-
 
 def _generate_starter_prompts(
     type1: str, type2: str, shared_topics: list[str]
@@ -899,77 +811,6 @@ CreateRoomDescription = RichToolDescription(
 
 from datetime import datetime, timedelta, timezone
 import secrets
-
-
-@mcp.tool(description=CreateRoomDescription.model_dump_json())
-async def create_room(
-    match_id: Annotated[
-        str,
-        Field(description="Match identifier returned by find_matches: 'userA|userB'."),
-    ],
-) -> str:
-    try:
-        user_a, user_b = match_id.split("|", 1)
-    except ValueError:
-        raise McpError(
-            ErrorData(code=INVALID_PARAMS, message="match_id must be 'userA|userB'")
-        )
-
-    try:
-        u1 = await db.get_user_profile(HTTP_CLIENT, user_a)
-        u2 = await db.get_user_profile(HTTP_CLIENT, user_b)
-    except (httpx.HTTPError, RuntimeError) as e:
-        logger.exception(
-            f"[create_room] load profiles error match_id={match_id}"
-        )
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Failed to load profiles: {e!r}")
-        )
-
-    if not u1 or not u2:
-        raise McpError(
-            ErrorData(
-                code=INVALID_PARAMS, message="Both users must have profiles saved"
-            )
-        )
-
-    if not (u1.get("is_looking") is True and u2.get("is_looking") is True):
-        raise McpError(
-            ErrorData(
-                code=INVALID_PARAMS,
-                message="Both users must be actively looking for matches to create a room",
-            )
-        )
-
-    token_a = secrets.token_urlsafe(24)
-    token_b = secrets.token_urlsafe(24)
-    expires_at = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
-    shared_topics = sorted(set(u1.get("topics", [])) & set(u2.get("topics", [])))
-    prompts = _generate_starter_prompts(
-        u1.get("type", "XXXX"), u2.get("type", "XXXX"), shared_topics
-    )
-
-    try:
-        row = await db.create_room_row(
-            HTTP_CLIENT,
-            participants=[user_a, user_b],
-            tokens={user_a: token_a, user_b: token_b},
-            expires_at=expires_at,
-        )
-        room_id = str(row.get("room_id") or uuid.uuid4())
-        logger.info(f"[create_room] created rooms row room_id={room_id}")
-    except (httpx.HTTPError, RuntimeError) as e:
-        logger.exception(f"[create_room] rooms error match_id={match_id}")
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Failed to create room: {e!r}")
-        )
-
-    return json.dumps({
-        "room_id": room_id,
-        "tokens": {user_a: token_a, user_b: token_b},
-        "expires_at": expires_at,
-        "starter_prompts": prompts,
-    })
 
 
 
@@ -1149,51 +990,318 @@ async def translate(
     return json.dumps({"target_type": t, "rewritten": rewritten})
 
 
-GetUserPersonalityDescription = RichToolDescription(
+def _get_personality_guidance_data(personality_type: str) -> dict:
+    """Comprehensive guidance data for all 16 MBTI types."""
+    
+    guidance_data = {
+        "INTJ": {
+            "career": {
+                "strengths": ["Natural strategic thinking", "Independent work style", "Long-term planning", "System optimization"],
+                "success_tips": ["Seek roles with autonomy", "Focus on complex problem-solving", "Build expertise in specialized areas", "Find mentors who appreciate your vision"],
+                "pitfalls": ["May struggle with office politics", "Can appear aloof to colleagues", "Might neglect networking", "Impatience with inefficiency"],
+                "warning_signs": ["Feeling micromanaged", "Forced into too many meetings", "Asked to do repetitive tasks", "Colleagues seem to avoid you"]
+            },
+            "relationships": {
+                "strengths": ["Loyal and committed", "Values deep connections", "Direct communication", "Supportive of partner's goals"],
+                "success_tips": ["Express appreciation explicitly", "Schedule quality time", "Be patient with emotions", "Share your thought process"],
+                "pitfalls": ["May seem emotionally distant", "Can be overly critical", "Struggles with small talk", "Difficulty expressing feelings"],
+                "warning_signs": ["Partner feels unheard", "Avoiding social gatherings", "Focusing only on problems", "Dismissing emotional needs"]
+            }
+        },
+        "INTP": {
+            "career": {
+                "strengths": ["Analytical thinking", "Creative problem-solving", "Research abilities", "Theoretical understanding"],
+                "success_tips": ["Pursue intellectually stimulating work", "Seek flexible schedules", "Find roles allowing deep focus", "Connect with like-minded colleagues"],
+                "pitfalls": ["Procrastination on routine tasks", "Difficulty with deadlines", "May ignore practical constraints", "Struggles with self-promotion"],
+                "warning_signs": ["Bored by mundane tasks", "Feeling rushed constantly", "No time for exploration", "Forced into people management"]
+            },
+            "relationships": {
+                "strengths": ["Intellectual companionship", "Respect for independence", "Loyalty to close friends", "Honest communication"],
+                "success_tips": ["Share intellectual interests", "Give space for thinking", "Appreciate their insights", "Be patient with emotional expression"],
+                "pitfalls": ["May neglect emotional needs", "Forgets important dates", "Avoids conflict resolution", "Difficulty with routine relationship maintenance"],
+                "warning_signs": ["Partner feels emotionally neglected", "Avoiding social commitments", "Intellectualizing feelings", "Withdrawing when stressed"]
+            }
+        },
+        "ENTJ": {
+            "career": {
+                "strengths": ["Natural leadership", "Strategic vision", "Goal achievement", "Efficiency focus"],
+                "success_tips": ["Take on leadership roles", "Set ambitious goals", "Build strong networks", "Develop emotional intelligence"],
+                "pitfalls": ["May be seen as domineering", "Impatience with slower colleagues", "Workaholic tendencies", "Difficulty delegating"],
+                "warning_signs": ["Team seems intimidated", "High turnover in your area", "Constantly working overtime", "Stressed about details"]
+            },
+            "relationships": {
+                "strengths": ["Protective and supportive", "Helps partners achieve goals", "Clear communication", "Long-term commitment"],
+                "success_tips": ["Listen before advising", "Show vulnerability", "Appreciate your partner's style", "Schedule relationship time"],
+                "pitfalls": ["May try to 'fix' partner", "Can be controlling", "Work takes priority", "Difficulty showing emotions"],
+                "warning_signs": ["Partner feels controlled", "Relationship feels like a project", "No time for intimacy", "Always talking about work"]
+            }
+        },
+        "ENTP": {
+            "career": {
+                "strengths": ["Innovation and creativity", "Adaptability", "Networking abilities", "Big-picture thinking"],
+                "success_tips": ["Seek variety in projects", "Build on networking strengths", "Partner with detail-oriented people", "Focus on innovation roles"],
+                "pitfalls": ["Struggles with routine tasks", "May abandon projects mid-way", "Difficulty with administrative work", "Overpromises on timelines"],
+                "warning_signs": ["Feeling trapped by routine", "Multiple unfinished projects", "Avoiding paperwork", "Losing interest quickly"]
+            },
+            "relationships": {
+                "strengths": ["Enthusiastic and engaging", "Brings excitement to relationships", "Intellectually stimulating", "Adaptable to change"],
+                "success_tips": ["Keep relationships fresh and interesting", "Follow through on commitments", "Listen actively", "Show appreciation for stability"],
+                "pitfalls": ["May get bored easily", "Struggles with routine relationship tasks", "Can be argumentative", "Difficulty with emotional depth"],
+                "warning_signs": ["Partner feels neglected", "Avoiding serious conversations", "Looking for excitement elsewhere", "Making promises you don't keep"]
+            }
+        },
+        "INFJ": {
+            "career": {
+                "strengths": ["Empathy and insight", "Long-term vision", "Helping others develop", "Creative problem-solving"],
+                "success_tips": ["Find meaning-driven work", "Seek quiet work environments", "Use your insight to help others", "Set boundaries to prevent burnout"],
+                "pitfalls": ["Perfectionism leads to stress", "Difficulty saying no", "May burn out from helping others", "Sensitive to criticism"],
+                "warning_signs": ["Feeling overwhelmed constantly", "Taking on too much", "Losing sleep over work", "Avoiding feedback sessions"]
+            },
+            "relationships": {
+                "strengths": ["Deep understanding of others", "Loyal and caring", "Good listener", "Committed to growth"],
+                "success_tips": ["Communicate your needs clearly", "Take time for self-care", "Share your insights", "Set healthy boundaries"],
+                "pitfalls": ["May sacrifice own needs", "Holds unrealistic expectations", "Avoids conflict", "Takes things too personally"],
+                "warning_signs": ["Feeling resentful", "Partner doesn't know your needs", "Avoiding difficult conversations", "Feeling emotionally drained"]
+            }
+        },
+        "INFP": {
+            "career": {
+                "strengths": ["Creativity and imagination", "Values alignment", "Empathy for others", "Adaptability"],
+                "success_tips": ["Find work aligned with values", "Seek creative outlets", "Work with supportive teams", "Focus on helping others"],
+                "pitfalls": ["Struggles with criticism", "May avoid conflict", "Difficulty with strict deadlines", "Procrastination on unpleasant tasks"],
+                "warning_signs": ["Work feels meaningless", "Constant criticism", "No creative freedom", "Toxic work environment"]
+            },
+            "relationships": {
+                "strengths": ["Deep emotional connection", "Supportive and caring", "Values authenticity", "Loyal to loved ones"],
+                "success_tips": ["Express feelings openly", "Appreciate your partner's uniqueness", "Create meaningful traditions", "Practice direct communication"],
+                "pitfalls": ["May idealize relationships", "Avoids confrontation", "Takes criticism personally", "Needs excessive reassurance"],
+                "warning_signs": ["Feeling misunderstood", "Partner seems distant", "Avoiding important discussions", "Feeling emotionally overwhelmed"]
+            }
+        },
+        "ENFJ": {
+            "career": {
+                "strengths": ["Inspiring others", "Team building", "Communication skills", "People development"],
+                "success_tips": ["Take on mentoring roles", "Focus on team success", "Use your communication skills", "Set boundaries to avoid burnout"],
+                "pitfalls": ["May neglect own needs", "Takes on too much responsibility", "Sensitive to team conflicts", "Difficulty saying no"],
+                "warning_signs": ["Constantly helping others", "No time for yourself", "Team conflicts affect you deeply", "Feeling responsible for everyone"]
+            },
+            "relationships": {
+                "strengths": ["Supportive and encouraging", "Great communication", "Helps partner grow", "Creates harmony"],
+                "success_tips": ["Focus on your own needs too", "Allow partner independence", "Communicate directly", "Take breaks from giving"],
+                "pitfalls": ["May be overly accommodating", "Neglects self-care", "Takes relationship problems personally", "Tries to fix everything"],
+                "warning_signs": ["Feeling unappreciated", "Partner seems overwhelmed by attention", "You're always giving", "Relationship feels one-sided"]
+            }
+        },
+        "ENFP": {
+            "career": {
+                "strengths": ["Enthusiasm and energy", "Creativity", "People skills", "Seeing potential in others"],
+                "success_tips": ["Seek variety and flexibility", "Use your people skills", "Focus on big-picture projects", "Work with inspiring colleagues"],
+                "pitfalls": ["Struggles with routine tasks", "May overcommit", "Difficulty with details", "Gets bored easily"],
+                "warning_signs": ["Feeling trapped by routine", "Multiple unfinished projects", "Avoiding administrative tasks", "Looking for new opportunities constantly"]
+            },
+            "relationships": {
+                "strengths": ["Brings joy and excitement", "Supportive of partner's dreams", "Great at seeing potential", "Enthusiastic about shared activities"],
+                "success_tips": ["Follow through on commitments", "Listen to partner's concerns", "Balance excitement with stability", "Show appreciation for routine"],
+                "pitfalls": ["May neglect routine relationship needs", "Gets distracted by new interests", "Avoids serious conversations", "Makes promises impulsively"],
+                "warning_signs": ["Partner feels neglected", "Avoiding commitment discussions", "Looking for excitement elsewhere", "Breaking promises frequently"]
+            }
+        },
+        "ISTJ": {
+            "career": {
+                "strengths": ["Reliability and consistency", "Attention to detail", "Planning abilities", "Respect for procedures"],
+                "success_tips": ["Excel in structured environments", "Use your organizational skills", "Build expertise gradually", "Seek stable, reputable companies"],
+                "pitfalls": ["May resist change", "Struggles with ambiguous situations", "Can be seen as inflexible", "May miss big-picture opportunities"],
+                "warning_signs": ["Constant organizational changes", "Unclear expectations", "Being pushed to innovate rapidly", "Lack of clear procedures"]
+            },
+            "relationships": {
+                "strengths": ["Dependable and loyal", "Shows love through actions", "Provides stability", "Committed long-term"],
+                "success_tips": ["Express appreciation verbally", "Be open to new experiences", "Communicate your needs", "Show affection regularly"],
+                "pitfalls": ["May seem emotionally distant", "Resistant to change", "Difficulty expressing feelings", "Takes things literally"],
+                "warning_signs": ["Partner wants more spontaneity", "Feeling emotionally disconnected", "Avoiding new experiences", "Partner seems frustrated with routine"]
+            }
+        },
+        "ISFJ": {
+            "career": {
+                "strengths": ["Helping others", "Attention to detail", "Reliability", "Team harmony"],
+                "success_tips": ["Find service-oriented roles", "Use your people skills", "Seek appreciative environments", "Set boundaries to prevent burnout"],
+                "pitfalls": ["May be taken advantage of", "Difficulty saying no", "Avoids self-promotion", "Sensitive to criticism"],
+                "warning_signs": ["Constantly helping others", "No recognition for efforts", "Feeling overwhelmed", "Being asked to do everyone's work"]
+            },
+            "relationships": {
+                "strengths": ["Caring and supportive", "Remembers important details", "Creates comfortable home", "Puts others first"],
+                "success_tips": ["Express your own needs", "Accept help from others", "Communicate when hurt", "Take time for self-care"],
+                "pitfalls": ["May sacrifice own needs", "Holds grudges silently", "Avoids conflict", "Expects appreciation without asking"],
+                "warning_signs": ["Feeling unappreciated", "Doing everything for others", "Feeling resentful", "Partner doesn't know you're upset"]
+            }
+        },
+        "ESTJ": {
+            "career": {
+                "strengths": ["Leadership abilities", "Organizational skills", "Goal achievement", "Decision making"],
+                "success_tips": ["Take on management roles", "Focus on results", "Build efficient systems", "Develop people skills"],
+                "pitfalls": ["May be seen as controlling", "Impatience with inefficiency", "Difficulty with change", "May neglect relationship building"],
+                "warning_signs": ["Team seems reluctant to share ideas", "High stress from constant pressure", "Resistance to your methods", "Feeling isolated from colleagues"]
+            },
+            "relationships": {
+                "strengths": ["Provides stability and security", "Takes care of practical needs", "Loyal and committed", "Clear about expectations"],
+                "success_tips": ["Listen to emotions, not just facts", "Show appreciation for differences", "Allow for flexibility", "Express feelings more"],
+                "pitfalls": ["May be too controlling", "Focuses on tasks over emotions", "Difficulty with partner's feelings", "Expects efficiency in relationship"],
+                "warning_signs": ["Partner feels controlled", "Relationship feels like a business", "Partner stops sharing feelings", "Conflicts over different approaches"]
+            }
+        },
+        "ESFJ": {
+            "career": {
+                "strengths": ["People skills", "Team harmony", "Service orientation", "Practical application"],
+                "success_tips": ["Work in people-focused roles", "Build strong relationships", "Seek appreciative environments", "Use your organizational skills"],
+                "pitfalls": ["Takes criticism personally", "May avoid conflict", "Difficulty saying no", "Sensitive to team dysfunction"],
+                "warning_signs": ["Constant criticism", "Toxic team environment", "Being taken advantage of", "No appreciation for efforts"]
+            },
+            "relationships": {
+                "strengths": ["Warm and caring", "Creates social connections", "Remembers special occasions", "Makes others feel valued"],
+                "success_tips": ["Communicate your needs directly", "Accept that not everyone shows care the same way", "Take time for yourself", "Don't take things personally"],
+                "pitfalls": ["May be overly sensitive", "Needs constant reassurance", "Avoids difficult conversations", "Takes responsibility for others' emotions"],
+                "warning_signs": ["Feeling unappreciated", "Partner seems distant", "Avoiding conflict", "Feeling responsible for everyone's happiness"]
+            }
+        },
+        "ISTP": {
+            "career": {
+                "strengths": ["Problem-solving skills", "Practical application", "Independence", "Crisis management"],
+                "success_tips": ["Seek hands-on work", "Value flexibility and autonomy", "Focus on practical solutions", "Avoid micromanagement"],
+                "pitfalls": ["May seem disengaged", "Struggles with long-term planning", "Avoids office politics", "Difficulty with emotional aspects"],
+                "warning_signs": ["Too many meetings", "Rigid schedules", "Emotional workplace drama", "No hands-on work"]
+            },
+            "relationships": {
+                "strengths": ["Loyal and dependable", "Shows love through actions", "Gives space to partner", "Practical problem-solver"],
+                "success_tips": ["Express feelings verbally", "Make time for relationship talk", "Show interest in partner's emotions", "Plan some activities together"],
+                "pitfalls": ["May seem emotionally distant", "Avoids relationship discussions", "Needs excessive alone time", "Difficulty with emotional support"],
+                "warning_signs": ["Partner wants more emotional connection", "Avoiding serious conversations", "Spending all free time alone", "Partner feels neglected"]
+            }
+        },
+        "ISFP": {
+            "career": {
+                "strengths": ["Creativity and aesthetics", "Helping others individually", "Adaptability", "Values alignment"],
+                "success_tips": ["Find meaningful work", "Seek creative outlets", "Work with supportive people", "Avoid high-conflict environments"],
+                "pitfalls": ["Avoids competition", "Struggles with criticism", "May procrastinate", "Difficulty with self-promotion"],
+                "warning_signs": ["Competitive, cutthroat environment", "Constant criticism", "No creative freedom", "Values conflict with company"]
+            },
+            "relationships": {
+                "strengths": ["Gentle and caring", "Supports partner's individuality", "Loyal and committed", "Creates peaceful environment"],
+                "success_tips": ["Communicate needs clearly", "Don't avoid all conflict", "Express appreciation", "Share your creative side"],
+                "pitfalls": ["Avoids confrontation", "May be too accommodating", "Sensitive to criticism", "Difficulty expressing needs"],
+                "warning_signs": ["Feeling taken for granted", "Partner doesn't know your needs", "Avoiding important discussions", "Feeling emotionally overwhelmed"]
+            }
+        },
+        "ESTP": {
+            "career": {
+                "strengths": ["Adaptability", "People skills", "Crisis management", "Practical problem-solving"],
+                "success_tips": ["Seek variety and action", "Use your networking abilities", "Focus on immediate results", "Avoid too much planning"],
+                "pitfalls": ["May seem impulsive", "Struggles with long-term planning", "Bored by routine", "Difficulty with detailed analysis"],
+                "warning_signs": ["Too much planning required", "Isolated work environment", "Repetitive tasks", "No variety or excitement"]
+            },
+            "relationships": {
+                "strengths": ["Fun and spontaneous", "Adaptable to partner's needs", "Enjoys shared activities", "Brings excitement"],
+                "success_tips": ["Balance fun with serious talk", "Follow through on commitments", "Listen to partner's need for planning", "Show emotional support"],
+                "pitfalls": ["May avoid serious conversations", "Impulsive decisions", "Needs constant stimulation", "Difficulty with routine"],
+                "warning_signs": ["Partner wants more stability", "Avoiding future planning", "Getting bored with relationship", "Making impulsive relationship decisions"]
+            }
+        },
+        "ESFP": {
+            "career": {
+                "strengths": ["Enthusiasm and energy", "People skills", "Adaptability", "Team collaboration"],
+                "success_tips": ["Work with people", "Seek variety and fun", "Use your communication skills", "Focus on positive team culture"],
+                "pitfalls": ["Struggles with criticism", "May avoid conflict", "Difficulty with detailed planning", "Needs approval from others"],
+                "warning_signs": ["Isolated work environment", "Constant criticism", "Rigid procedures", "No social interaction"]
+            },
+            "relationships": {
+                "strengths": ["Warm and affectionate", "Makes relationships fun", "Supportive and encouraging", "Good at reading emotions"],
+                "success_tips": ["Balance fun with serious discussions", "Don't take criticism personally", "Communicate your needs", "Plan some activities in advance"],
+                "pitfalls": ["May avoid difficult conversations", "Needs constant reassurance", "Can be overly emotional", "Difficulty with partner's criticism"],
+                "warning_signs": ["Partner seems distant", "Avoiding serious topics", "Feeling criticized constantly", "Relationship lacks depth"]
+            }
+        }
+    }
+    
+    return guidance_data.get(personality_type, {
+        "career": {
+            "strengths": ["Unique perspective", "Individual contributions"],
+            "success_tips": ["Know your strengths", "Seek supportive environments", "Communicate your value"],
+            "pitfalls": ["May struggle with unclear expectations"],
+            "warning_signs": ["Feeling misunderstood consistently"]
+        },
+        "relationships": {
+            "strengths": ["Authentic connection", "Individual approach"],
+            "success_tips": ["Communicate openly", "Respect differences", "Build on strengths"],
+            "pitfalls": ["May have mismatched expectations"],
+            "warning_signs": ["Feeling disconnected from others"]
+        }
+    })
+
+
+GetPersonalityGuidanceDescription = RichToolDescription(
     description=(
-        "Get user's personality type, either from database or by generating a quiz if needed. "
-        "Checks for existing personality data first to avoid redundant quiz prompts. "
-        "Returns stored type with confidence scores, or generates new quiz if no data exists."
+        "Provides comprehensive career and relationship advice based on the user's MBTI personality type. "
+        "Returns structured guidance including strengths, success tips, pitfalls to avoid, and warning signs. "
+        "Automatically looks up user's personality type from quiz results."
     ),
-    use_when="User asks about their personality type or when personality data is needed for matching.",
-    side_effects="May generate quiz if no existing data found.",
+    use_when="User wants comprehensive life guidance based on their personality type for career or relationship success.",
+    side_effects=None,
 )
 
 
-@mcp.tool(description=GetUserPersonalityDescription.model_dump_json())
-async def get_user_personality(
-    user_id: Annotated[str, Field(description="User ID to get personality for.")],
-    force_retake: Annotated[bool, Field(description="Force user to retake quiz even if exists.")] = False,
+@mcp.tool(description=GetPersonalityGuidanceDescription.model_dump_json())
+async def get_personality_guidance(
+    user_id: Annotated[str, Field(description="User ID to get guidance for.")],
+    guidance_type: Annotated[
+        str, 
+        Field(description="Type of guidance: 'career', 'relationships', or 'both' (default)")
+    ] = "both",
 ) -> str:
-    """Smart personality retrieval that avoids unnecessary quiz prompts."""
+    """Provide comprehensive career and relationship guidance based on personality type."""
     
-    # Check if user already has personality data
-    if not force_retake:
-        try:
-            rows = await db.get_users_quiz_by_ids(HTTP_CLIENT, [user_id])
-            if rows:
-                existing_data = rows[0]
-                personality_type = existing_data.get("type")
-                confidence = existing_data.get("confidence_by_axis", {})
-                created_at = existing_data.get("created_at")
-                
-                return json.dumps({
-                    "has_existing": True,
-                    "type": personality_type,
-                    "confidence_by_axis": confidence,
-                    "created_at": created_at,
-                    "message": f"Your personality type is {personality_type}. This was determined on {created_at}."
-                })
-        except Exception as e:
-            logger.exception(f"Error checking existing personality for {user_id}")
+    if not user_id:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="user_id is required"))
     
-    # No existing data or force retake - generate quiz
-    quiz_data = await generate_quiz()
-    return json.dumps({
-        "has_existing": False,
-        "quiz_data": json.loads(quiz_data),
-        "message": "Please take this personality quiz to determine your type."
-    })
+    guidance_type = guidance_type.lower().strip()
+    if guidance_type not in ["career", "relationships", "both"]:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="guidance_type must be 'career', 'relationships', or 'both'"))
+    
+    # Look up user's personality type from quiz results
+    personality_type = None
+    try:
+        quiz_rows = await db.get_users_quiz_by_ids(HTTP_CLIENT, [user_id])
+        if quiz_rows:
+            personality_type = quiz_rows[0].get("type")
+    except (httpx.HTTPError, RuntimeError) as e:
+        logger.exception(f"[get_personality_guidance] read users_quiz error user_id={user_id}")
+        raise McpError(
+            ErrorData(code=INTERNAL_ERROR, message=f"Failed to load personality type: {e!r}")
+        )
+    
+    if not personality_type:
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS, 
+                message="No personality type found for user. Please complete the quiz first using generate_quiz and submit_quiz_compact."
+            )
+        )
+    
+    personality_type = _normalize_mbti_type(personality_type)
+    guidance_data = _get_personality_guidance_data(personality_type)
+    
+    # Build response based on requested guidance type
+    response = {
+        "personality_type": personality_type,
+        "guidance_type": guidance_type
+    }
+    
+    if guidance_type in ["career", "both"]:
+        response["career"] = guidance_data.get("career", {})
+    
+    if guidance_type in ["relationships", "both"]:
+        response["relationships"] = guidance_data.get("relationships", {})
+    
+    logger.info(f"[get_personality_guidance] Generated {guidance_type} guidance for {personality_type} user_id={user_id}")
+    
+    return json.dumps(response, indent=2)
 
 
 CheckUserDataStatusDescription = RichToolDescription(
