@@ -220,17 +220,7 @@ class Fetch:
         return links or ["<error>No results found.</error>"]
 
 
-def _extract_b64(data: str) -> str:
-    if data.startswith("data:"):
-        idx = data.find("base64,")
-        if idx != -1:
-            return data[idx + 7 :]
-    return data
 
-
-def _approx_raw_size(b64: str) -> int:
-    pad = b64.count("=")
-    return (len(b64) * 3) // 4 - pad
 
 
 async def _post_with_retries(
@@ -272,6 +262,10 @@ mcp = FastMCP(
     "Type-to-Talk MCP Server",
     auth=SimpleBearerAuthProvider(TOKEN),
 )
+
+@mcp.tool
+async def about() -> dict:
+    return {"name": mcp.name, "description": "This is a Personality Coach mcp server that provides personality insights and guidance based on the user's MBTI type. It is a work in progress and will be updated regularly. It uses the MBTI personality type to provide guidance and insights to the user."}
 
 # --- Tool: validate (required by Puch) ---
 @mcp.tool
