@@ -1,266 +1,553 @@
-# MCP Starter for Puch AI
+# 🎯 Personality Coach MCP Server - Puch AI Hackathon Project
 
-This is a starter template for creating your own Model Context Protocol (MCP) server that works with Puch AI. It comes with ready-to-use tools for job searching and image processing.
+**A comprehensive MBTI personality assessment and coaching platform built with Model Context Protocol (MCP)**
 
-## What is MCP?
+This project is a sophisticated personality coaching system that combines MBTI personality assessment, intelligent matching algorithms, and personalized coaching tools. Built for the Puch AI Hackathon, it demonstrates the power of MCP to create AI-driven personality insights and relationship coaching.
 
-MCP (Model Context Protocol) allows AI assistants like Puch to connect to external tools and data sources safely. Think of it like giving your AI extra superpowers without compromising security.
+## 🌟 Project Overview
 
-## What's Included in This Starter?
+The Personality Coach MCP Server is a full-featured personality assessment and coaching platform that provides:
 
-### 🎯 Job Finder Tool
-- **Analyze job descriptions** - Paste any job description and get smart insights
-- **Fetch job postings from URLs** - Give a job posting link and get the full details
-- **Search for jobs** - Use natural language to find relevant job opportunities
+- **MBTI Personality Assessment**: Advanced 16-question quiz with statistical confidence scoring
+- **Intelligent Matching System**: Algorithm-driven personality compatibility matching
+- **Personalized Coaching**: Context-aware tips for communication and relationship building
+- **Real-time Communication Tools**: Message translation and tone adaptation
+- **Persistent User Profiles**: Complete user state management with PostgreSQL/Supabase
 
-### 🖼️ Image Processing Tool
-- **Convert images to black & white** - Upload any image and get a monochrome version
+## 🛠 Technology Stack
 
-### 💬 Type-to-Talk Matching & Coaching (NEW)
-- **generate_quiz** → produce a compact MBTI-style questionnaire
-- **submit_quiz** → compute 16-type and confidence-by-axis
-- **save_profile** → store preferences (availability, topics, intent)
-- **find_matches** → ranked candidates with plain-language rationales
-- **create_room** → private room with tokens and starter prompts
-- **set_counterpart / coach_tip / translate** → micro-coaching & tone translator
+### Core Technologies
+- **Python 3.11+**: Modern async/await architecture
+- **FastMCP**: High-performance MCP server framework
+- **HTTPX**: Async HTTP client with connection pooling
+- **Pydantic**: Type-safe data validation and serialization
 
-### 🔐 Built-in Authentication
-- Bearer token authentication (required by Puch AI)
-- Validation tool that returns your phone number
+### Authentication & Security
+- **Bearer Token Authentication**: RSA-based JWT token validation
+- **OAuth2 Support**: Industry-standard authentication protocols
+- **Secure Key Management**: Environment-based configuration
 
-## Quick Setup Guide
+### Database & Persistence
+- **PostgreSQL**: Primary database via Supabase
+- **PostgREST**: RESTful API layer for database operations
+- **JSONB Storage**: Flexible schema for personality data
+- **Automatic Timestamps**: Audit trail with triggers
 
-### Step 1: Install Dependencies
+### Containerization & Deployment
+- **Docker**: Containerized deployment with multi-stage builds
+- **Docker Compose**: Orchestrated development environment
+- **Health Checks**: Built-in monitoring and logging
+- **Environment Variables**: Configurable deployment settings
 
-First, make sure you have Python 3.11 or higher installed. Then:
+### Data Processing & Analysis
+- **Beautiful Soup**: HTML parsing for web scraping
+- **Readabilipy**: Content extraction and simplification
+- **Markdownify**: HTML to Markdown conversion
+- **Statistical Analysis**: Confidence scoring algorithms
 
+## 🧠 Core Features
+
+### 1. Advanced Personality Assessment
+
+#### MBTI Quiz Engine
+- **16-Question Assessment**: Scientifically-based questions covering all four personality axes
+- **Multi-format Input Support**: 
+  - Compact string format (`1a 2b 3c 4d`)
+  - Structured JSON responses
+  - Natural language answers ("strongly agree", "neutral")
+- **Statistical Confidence Scoring**: Axis-by-axis confidence metrics (0-1 scale)
+- **Response Sanitization**: Robust input validation and normalization
+
+```python
+# Example quiz generation
+{
+  "version": "1.0",
+  "variant": "fixed", 
+  "scale": {
+    "labels": ["Strongly disagree", "Disagree", "Slightly disagree", "Neutral", 
+               "Slightly agree", "Agree", "Strongly agree"],
+    "values": [-3, -2, -1, 0, 1, 2, 3]
+  },
+  "questions": [
+    {
+      "id": "EI-1",
+      "axis": "EI", 
+      "prompt": "I feel energized by group conversations.",
+      "positive_pole": "E"
+    }
+  ]
+}
+```
+
+#### Personality Type Computation
+- **Axis Scoring**: Independent scoring for E/I, S/N, T/F, J/P dimensions
+- **Type Derivation**: Algorithmic computation of 16-type classification
+- **Confidence Metrics**: Statistical reliability measures per axis
+- **Data Validation**: Comprehensive input sanitization and error handling
+
+### 2. Intelligent Matching System(Upcoming feature)
+
+#### Compatibility Algorithm
+- **Type Compatibility Scoring**: Multi-dimensional personality fit analysis
+- **Shared Interest Detection**: Topic-based affinity matching
+- **Availability Overlap**: Time-window intersection calculation
+- **Intent Alignment**: Purpose-driven matching (networking, mentoring, etc.)
+
+#### Matching Features
+- **Ranked Results**: Scored candidate list with explanations
+- **Plain-language Rationales**: Human-readable matching explanations
+- **Configurable Limits**: Adjustable result set sizes
+- **Real-time Updates**: Dynamic matching as profiles change
+
+```python
+# Example match result
+{
+  "match_id": "user1|user2",
+  "score": 3.2,
+  "rationale": "Matched due to shared interests in AI, startups, type fit INTJ × ENFP, 
+               similar intent, and time overlap Monday 19:00-20:00.",
+  "shared_topics": ["ai", "startups"],
+  "availability_overlap": "Monday 19:00-20:00"
+}
+```
+
+### 3. Comprehensive Coaching System
+
+#### Communication Coaching
+- **Type-specific Tips**: Tailored advice for communicating with each MBTI type
+- **Context-aware Guidance**: Situation-specific coaching (feedback, collaboration, conflict)
+- **Micro-coaching**: Quick, actionable suggestions for immediate use
+
+#### Message Translation
+- **Tone Adaptation**: Rewrite messages for specific personality types
+- **Style Scaffolding**: Structured templates for effective communication
+- **Preference Matching**: Adjust communication style to recipient preferences
+
+#### Career & Relationship Guidance
+- **Comprehensive Advice**: Detailed guidance for all 16 personality types
+- **Strengths & Pitfalls**: Balanced perspective on type-specific challenges
+- **Warning Signs**: Early indicators of potential issues
+- **Success Strategies**: Proven approaches for each type
+
+### 4. User Profile Management
+
+#### Profile Components
+- **Personality Data**: Type, confidence scores, quiz history
+- **Availability Windows**: Flexible time-based scheduling
+- **Interest Topics**: Tagged preference system
+- **Intent Classification**: Purpose-driven categorization
+- **Counterpart Management**: Stored reference types for coaching
+
+#### Data Persistence
+- **PostgreSQL Backend**: Reliable, ACID-compliant storage
+- **Automatic Timestamps**: Created/updated tracking
+- **JSONB Flexibility**: Schema-less preference storage
+- **Migration Support**: Backward-compatible schema updates
+
+## 🏗 Architecture
+
+### Server Architecture
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    MCP Server (FastMCP)                    │
+├─────────────────────────────────────────────────────────────┤
+│  Authentication Layer (Bearer Token + RSA)                 │
+├─────────────────────────────────────────────────────────────┤
+│                    Business Logic                          │
+│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐         │
+│  │ Quiz Engine │ │  Matching   │ │  Coaching   │         │
+│  │             │ │  Algorithm  │ │  System     │         │
+│  └─────────────┘ └─────────────┘ └─────────────┘         │
+├─────────────────────────────────────────────────────────────┤
+│                 Database Layer (db.py)                     │
+├─────────────────────────────────────────────────────────────┤
+│               Supabase/PostgreSQL                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow
+1. **Authentication**: Bearer token validation via RSA keypair
+2. **Request Processing**: Pydantic validation and type checking
+3. **Business Logic**: Domain-specific processing (quiz, matching, coaching)
+4. **Data Persistence**: Async database operations via PostgREST
+5. **Response Generation**: JSON serialization with error handling
+
+### Database Schema
+```sql
+-- Core personality data
+users_quiz (user_id, type, confidence_by_axis, axis_sums, raw_answers, sanitized_answers)
+
+-- User preferences and matching data  
+users_profile (user_id, type, availability, topics, intent, is_looking)
+
+-- Coaching relationships
+user_counterpart_type (user_id, counterpart_type)
+
+-- Communication rooms
+rooms (room_id, participants, tokens, expires_at)
+```
+
+## 🚀 Getting Started
+
+### Prerequisites
+- **Python 3.11+**: Modern Python with async support
+- **Docker & Docker Compose**: For containerized deployment
+- **Supabase Account**: For persistent data storage
+- **ngrok Account**: For public HTTPS endpoint (development)
+
+### Quick Setup
+
+1. **Clone and Install**
 ```bash
-# Create virtual environment
-uv venv
-
-# Install all required packages
-uv sync
-
-# Activate the environment
+git clone <repository-url>
+cd puchaihackathon/mcp-starter
+uv venv && uv sync
 source .venv/bin/activate
 ```
 
-### Step 2: Set Up Environment Variables
-
-Create a `.env` file in the project root:
-
+2. **Configure Environment**
 ```bash
-# Copy the example file
 cp .env.example .env
+# Edit .env with your tokens and Supabase credentials
 ```
 
-Then edit `.env` and add your details:
-
-```env
-AUTH_TOKEN=your_secret_token_here
-MY_NUMBER=919876543210
-# Optional for ingredients analyzer only
-# PERPLEXITY_API_KEY=...
-
-# Supabase for persistent Type‑to‑Talk state
-# SUPABASE_URL=https://<project>.supabase.co
-# SUPABASE_SERVICE_ROLE_KEY=...
-```
-
-**Important Notes:**
-- `AUTH_TOKEN`: This is your secret token for authentication. Keep it safe!
-- `MY_NUMBER`: Your WhatsApp number in format `{country_code}{number}` (e.g., `919876543210` for +91-9876543210)
-
-### Step 3: Run the Server (Local Python)
-
+3. **Set up Database**
 ```bash
-cd mcp-bearer-token
-python mcp_starter.py
+# In Supabase SQL editor, run the contents of supabase_schema.sql
 ```
 
-You'll see: `🚀 Starting MCP server on http://0.0.0.0:8086`
-
-### Step 4: Run with Docker
-
+4. **Run Server**
 ```bash
-cd mcp-starter
-cp .env.example .env   # then edit values
+# Local development
+cd mcp-bearer-token && python mcp_starter.py
 
-# Build
-docker compose build
-
-# Run
-docker compose up -d
-
-# View logs
-docker compose logs -f
-```
-
-The server will be available on `http://localhost:8086`.
-
-### Step 4.1: Enable Supabase (Persistent State)
-
-Type‑to‑Talk tools now persist state using Supabase (Postgres via PostgREST).
-
-1) Create a Supabase project and get:
-- `SUPABASE_URL` (e.g., `https://<project>.supabase.co`)
-- `SUPABASE_SERVICE_ROLE_KEY` (Settings → API → Service role)
-
-2) Apply schema:
-- Open Supabase SQL editor and paste the contents of `mcp-starter/supabase_schema.sql`. Run it once.
-
-3) Configure environment:
-- Add to your `.env` (or set in your deploy environment):
-  ```env
-  SUPABASE_URL=your_supabase_url
-  SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
-  ```
-
-4) Rebuild and run:
-```bash
-docker compose build
+# Or with Docker
 docker compose up -d
 ```
 
-Notes:
-- PostgREST is used over HTTP with the server's existing async client. No extra DB drivers required.
-- If Supabase env vars are missing, DB-backed tools will return errors.
+5. **Expose Publicly**
+```bash
+ngrok http 8086
+# Note the HTTPS URL for Puch AI connection
+```
 
-### Step 5: Make It Public (Required by Puch)
+### Environment Configuration
 
-Since Puch needs to access your server over HTTPS, you need to expose your local server:
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `AUTH_TOKEN` | Secret authentication token | ✅ |
+| `MY_NUMBER` | WhatsApp number (format: 919876543210) | ✅ |
+| `SUPABASE_URL` | Supabase project URL | ✅ |
+| `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role key | ✅ |
+| `LOG_LEVEL` | Logging verbosity (INFO, DEBUG) | ❌ |
+| `HTTP_MAX_CONNECTIONS` | HTTP client connection pool size | ❌ |
+| `HTTP_MAX_KEEPALIVE` | HTTP keep-alive connections | ❌ |
 
-#### Option A: Using ngrok (Recommended)
+## 🔧 API Reference
 
-1. **Install ngrok:**
-   Download from https://ngrok.com/download
+### Core Tools
 
-2. **Get your authtoken:**
-   - Go to https://dashboard.ngrok.com/get-started/your-authtoken
-   - Copy your authtoken
-   - Run: `ngrok config add-authtoken YOUR_AUTHTOKEN`
+#### `generate_quiz()`
+Generates a standardized 16-question MBTI assessment.
 
-3. **Start the tunnel:**
-   ```bash
-   ngrok http 8086
+**Parameters**: None (fixed configuration)
+**Returns**: JSON quiz structure with questions and scale
+
+#### `submit_quiz_compact(user_id, answers_compact)`
+Processes quiz responses in compact string format.
+
+**Parameters**:
+- `user_id`: Unique user identifier
+- `answers_compact`: String like "1a 2b 3c 4d 5e 6f 7g 8a..."
+
+**Returns**: `{type: "INTJ", confidence_by_axis: {EI: 0.8, SN: 0.9, TF: 0.7, JP: 0.85}}`
+
+#### `save_profile(user_id, type?, preferences?)`
+Stores user profile and matching preferences.
+
+**Parameters**:
+- `user_id`: User identifier
+- `type`: MBTI type (optional if quiz completed)
+- `preferences`: Availability, topics, intent, is_looking
+
+**Returns**: `{ok: true, type: "INTJ"}`
+
+#### `find_matches(user_id, limit?)`
+Finds compatible personality matches for a user.
+
+**Parameters**:
+- `user_id`: User to find matches for
+- `limit`: Maximum results (default: 5)
+
+**Returns**: Array of match objects with scores and rationales
+
+#### `coach_tip(user_id, context, target_type?)`
+Provides communication coaching for specific scenarios.
+
+**Parameters**:
+- `user_id`: Requesting user
+- `context`: Situation description
+- `target_type`: MBTI type to communicate with
+
+**Returns**: `{target_type: "ESFJ", tips: ["tip1", "tip2", "tip3"]}`
+
+#### `translate(message, target_type)`
+Rewrites message for specific personality type.
+
+**Parameters**:
+- `message`: Original message
+- `target_type`: MBTI type to adapt for
+
+**Returns**: `{target_type: "ISFJ", rewritten: "adapted message"}`
+
+### Utility Tools
+
+#### `validate()`
+Authentication validation (required by Puch AI).
+**Returns**: Phone number string
+
+#### `check_user_data_status(user_id)`
+Checks existing user data to guide conversation flow.
+**Returns**: Status object with data availability flags
+
+#### `get_personality_guidance(user_id, guidance_type?)`
+Comprehensive career and relationship advice.
+**Returns**: Detailed guidance based on personality type
+
+## 🎯 Usage Examples
+
+### Complete Personality Assessment Flow
+
+```bash
+# 1. Generate quiz
+/mcp tool generate_quiz {}
+
+# 2. Present questions to user and collect responses
+# 3. Submit compact answers
+/mcp tool submit_quiz_compact {
+  "user_id": "user123",
+  "answers_compact": "1a 2c 3e 4b 5f 6d 7g 8a 9c 10e 11b 12f 13d 14g 15a 16c"
+}
+
+# 4. Save user preferences
+/mcp tool save_profile {
+  "user_id": "user123",
+  "preferences": {
+    "availability": [{"day": "monday", "start": "18:00", "end": "20:00"}],
+    "topics": ["technology", "entrepreneurship"],
+    "intent": "networking"
+  }
+}
+
+# 5. Find matches
+/mcp tool find_matches {"user_id": "user123", "limit": 3}
+```
+
+### Communication Coaching Example
+
+```bash
+# Set a counterpart type for ongoing coaching
+/mcp tool set_counterpart {
+  "user_id": "user123", 
+  "counterpart_type": "ESFJ"
+}
+
+# Get situational coaching tips
+/mcp tool coach_tip {
+  "user_id": "user123",
+  "context": "need to give constructive feedback about missed deadline"
+}
+
+# Translate message for specific type
+/mcp tool translate {
+  "message": "We need to discuss the project timeline",
+  "target_type": "ISFP"
+}
+```
+
+## 🔍 Technical Deep Dive
+
+### Personality Assessment Algorithm
+
+The assessment uses a sophisticated scoring system:
+
+1. **Question Bank**: Carefully crafted questions for each MBTI axis
+2. **Response Mapping**: Flexible input handling (letters, numbers, text)
+3. **Confidence Calculation**: Statistical reliability per axis
+4. **Type Derivation**: Algorithmic type computation from axis scores
+
+### Matching Algorithm
+
+Compatibility scoring considers multiple factors:
+
+```python
+def _type_fit_score(t1: str, t2: str, c1: dict, c2: dict) -> float:
+    # Base compatibility by axis similarity/difference
+    # Weighted by confidence levels
+    # Returns 0-4 scale score
+```
+
+Factors:
+- **Personality Compatibility**: MBTI type interaction patterns
+- **Shared Interests**: Topic overlap analysis  
+- **Schedule Alignment**: Time window intersection
+- **Intent Matching**: Purpose compatibility
+
+### Data Security & Privacy
+
+- **Bearer Token Authentication**: Secure API access
+- **Environment-based Secrets**: No hardcoded credentials
+- **Input Sanitization**: Comprehensive validation
+- **Error Handling**: Graceful failure modes
+- **Audit Trails**: Automatic timestamp tracking
+
+## 📊 Performance & Scalability
+
+### Optimization Features
+- **Connection Pooling**: Async HTTP client with persistent connections
+- **Database Indexing**: Optimized queries with proper indexes
+- **Caching Strategy**: In-memory caching for frequently accessed data
+- **Async Architecture**: Non-blocking I/O throughout
+
+### Monitoring & Logging
+- **Structured Logging**: JSON-formatted logs with correlation IDs
+- **Error Tracking**: Comprehensive exception handling
+- **Performance Metrics**: Request timing and throughput monitoring
+- **Health Checks**: Built-in endpoint monitoring
+
+## 🚀 Deployment Options
+
+### Development (Local)
+```bash
+python mcp-bearer-token/mcp_starter.py
+ngrok http 8086
+```
+
+### Production (Docker)
+```bash
+docker compose up -d
+# Configure reverse proxy (nginx, traefik) for HTTPS
+```
+
+### Cloud Platforms
+- **Railway**: `railway up` with Dockerfile
+- **Render**: Connect GitHub repo with auto-deploy
+- **Heroku**: `git push heroku main`
+- **DigitalOcean App Platform**: Import from GitHub
+
+## 🤝 Connecting to Puch AI
+
+1. **Start your MCP server** (local or deployed)
+2. **Expose via HTTPS** (ngrok for development)
+3. **Connect in Puch AI**:
+   ```
+   /mcp connect https://your-domain.ngrok.app/mcp your_auth_token
+   ```
+4. **Verify connection**:
+   ```
+   /mcp validate
    ```
 
-#### Option B: Deploy to Cloud
+## 🛡 Security Considerations
 
-You can also deploy this to services like:
-- Railway
-- Render
-- Heroku
-- DigitalOcean App Platform
+- **Authentication**: Bearer token with RSA signature validation
+- **Input Validation**: Pydantic models with type checking
+- **SQL Injection**: Parameterized queries via PostgREST
+- **Rate Limiting**: HTTP client timeout and retry logic
+- **Error Sanitization**: No sensitive data in error messages
 
-## How to Connect with Puch AI
+## 🧪 Testing
 
-1. **[Open Puch AI](https://wa.me/+919998881729)** in your browser
-2. **Start a new conversation**
-3. **Use the connect command:**
-   ```
-   /mcp connect https://your-domain.ngrok.app/mcp your_secret_token_here
-   ```
-
-### Quick Demo via Puch Commands (Type‑to‑Talk)
-
-1) Verify server & phone
-```
-/mcp validate
+### Unit Tests
+```bash
+pytest mcp-bearer-token/test_quiz_utils.py -v
 ```
 
-2) Generate & submit quiz
-```
-/mcp tool generate_quiz {"num_per_axis":4,"variant":"general"}
-```
-Use the returned `questions` with the provided Likert scale. Then submit:
-```
-/mcp tool submit_quiz {"user_id":"u1","responses":[{"axis":"EI","value":2},{"axis":"SN","value":-1},{"axis":"TF","value":3},{"axis":"JP","value":1}]}
+### Integration Tests
+```bash
+# Test full quiz flow
+/mcp tool generate_quiz {}
+/mcp tool submit_quiz_compact {"user_id": "test", "answers_compact": "1a 2b 3c 4d"}
 ```
 
-3) Save profiles
-```
-/mcp tool save_profile {"user_id":"u1","preferences":{"availability":[{"day":"mon","start":"18:00","end":"20:00"}],"topics":["startups","ai"],"intent":"networking"}}
-/mcp tool save_profile {"user_id":"u2","type":"ENFP","preferences":{"availability":[{"day":"mon","start":"19:00","end":"21:00"}],"topics":["ai","design"],"intent":"networking"}}
-```
-
-4) Find matches and create room
-```
-/mcp tool find_matches {"user_id":"u1","limit":3}
-/mcp tool create_room {"match_id":"u1|u2"}
+### Load Testing
+```bash
+# Test concurrent connections
+ab -n 100 -c 10 http://localhost:8086/health
 ```
 
-5) Coaching utilities
+## 📈 Future Enhancements
+
+### Planned Features
+- **Advanced Analytics**: Personality trend analysis
+- **Group Dynamics**: Team compatibility assessment  
+- **Learning Algorithms**: Adaptive matching improvement
+- **Mobile App**: Native iOS/Android clients
+- **Video Coaching**: Real-time conversation analysis
+
+### Potential Integrations
+- **Calendar APIs**: Automatic availability sync
+- **Slack/Teams**: Workplace personality insights
+- **CRM Systems**: Sales personality matching
+- **HR Platforms**: Recruitment and team building
+
+## 📚 Resources & Documentation
+
+### Official Documentation
+- **Puch AI MCP Docs**: https://puch.ai/mcp
+- **FastMCP Framework**: https://github.com/puchao/fastmcp
+- **Model Context Protocol**: https://modelcontextprotocol.io
+
+### MBTI & Personality Science
+- **Myers-Briggs Foundation**: https://www.myersbriggs.org
+- **Personality Research**: Academic papers on type theory
+- **Statistical Validation**: Reliability and validity studies
+
+### Technical References
+- **Async Python**: https://docs.python.org/3/library/asyncio.html
+- **PostgreSQL JSONB**: https://www.postgresql.org/docs/current/datatype-json.html
+- **Supabase**: https://supabase.com/docs
+
+## 🤝 Contributing
+
+We welcome contributions! Please see our contributing guidelines:
+
+1. **Fork the repository**
+2. **Create a feature branch**: `git checkout -b feature/amazing-feature`
+3. **Commit changes**: `git commit -m 'Add amazing feature'`
+4. **Push to branch**: `git push origin feature/amazing-feature`
+5. **Open a Pull Request**
+
+### Development Setup
+```bash
+git clone <your-fork>
+cd puchaihackathon/mcp-starter
+uv venv && uv sync
+pre-commit install  # Code formatting and linting
 ```
-/mcp tool set_counterpart {"user_id":"u1","counterpart_type":"INTJ"}
-/mcp tool coach_tip {"user_id":"u1","context":"give feedback about missed deadline"}
-/mcp tool translate {"message":"Hey, can we review the plan and adjust our deadline?","target_type":"ISFJ"}
-```
 
-Notes:
-- Ingredients analyzer requires `PERPLEXITY_API_KEY`. Type‑to‑Talk tools work without it.
-- With Supabase configured, profiles, quiz results, counterparts, matching, and rooms persist across restarts.
+## 📄 License
 
-### Debug Mode
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-To get more detailed error messages:
+## 🏆 Hackathon Context
 
-```
-/mcp diagnostics-level debug
-```
+This project was built for the **Puch AI Hackathon** to demonstrate the capabilities of the Model Context Protocol in creating sophisticated AI-powered applications. It showcases:
 
-## Customizing the Starter
+- **Advanced MCP Integration**: Complex tool orchestration
+- **Real-world Application**: Practical personality coaching
+- **Technical Excellence**: Production-ready architecture
+- **Innovation**: Novel personality assessment approach
 
-### Adding New Tools
+## 📞 Support & Contact
 
-1. **Create a new tool function:**
-   ```python
-   @mcp.tool(description="Your tool description")
-   async def your_tool_name(
-       parameter: Annotated[str, Field(description="Parameter description")]
-   ) -> str:
-       # Your tool logic here
-       return "Tool result"
-   ```
-
-2. **Add required imports** if needed
-
-
-## 📚 **Additional Documentation Resources**
-
-### **Official Puch AI MCP Documentation**
-- **Main Documentation**: https://puch.ai/mcp
-- **Protocol Compatibility**: Core MCP specification with Bearer & OAuth support
-- **Command Reference**: Complete MCP command documentation
-- **Server Requirements**: Tool registration, validation, HTTPS requirements
-
-### **Technical Specifications**
-- **JSON-RPC 2.0 Specification**: https://www.jsonrpc.org/specification (for error handling)
-- **MCP Protocol**: Core protocol messages, tool definitions, authentication
-
-### **Supported vs Unsupported Features**
-
-**✓ Supported:**
-- Core protocol messages
-- Tool definitions and calls
-- Authentication (Bearer & OAuth)
-- Error handling
-
-**✗ Not Supported:**
-- Videos extension
-- Resources extension
-- Prompts extension
-
-## Getting Help
-
-- **Join Puch AI Discord:** https://discord.gg/VMCnMvYx
-- **Check Puch AI MCP docs:** https://puch.ai/mcp
-- **Puch WhatsApp Number:** +91 99988 81729
+- **Puch AI Discord**: https://discord.gg/VMCnMvYx
+- **Puch AI Documentation**: https://puch.ai/mcp
+- **Project Issues**: [GitHub Issues](issues)
+- **Puch WhatsApp**: +91 99988 81729
 
 ---
 
-**Happy coding! 🚀**
+**Built with ❤️ for the Puch AI Hackathon**
 
-Use the hashtag `#BuildWithPuch` in your posts about your MCP!
-
-This starter makes it super easy to create your own MCP server for Puch AI. Just follow the setup steps and you'll be ready to extend Puch with your custom tools!
+*Use hashtag `#BuildWithPuch` when sharing this project!*
