@@ -485,12 +485,6 @@ ab -n 100 -c 10 http://localhost:8086/health
 - **Mobile App**: Native iOS/Android clients
 - **Video Coaching**: Real-time conversation analysis
 
-### Potential Integrations
-- **Calendar APIs**: Automatic availability sync
-- **Slack/Teams**: Workplace personality insights
-- **CRM Systems**: Sales personality matching
-- **HR Platforms**: Recruitment and team building
-
 ## 📚 Resources & Documentation
 
 ### Official Documentation
@@ -539,15 +533,3 @@ This project was built for the **Puch AI Hackathon** to demonstrate the capabili
 - **Technical Excellence**: Production-ready architecture
 - **Innovation**: Novel personality assessment approach
 
-## 📞 Support & Contact
-
-- **Puch AI Discord**: https://discord.gg/VMCnMvYx
-- **Puch AI Documentation**: https://puch.ai/mcp
-- **Project Issues**: [GitHub Issues](issues)
-- **Puch WhatsApp**: +91 99988 81729
-
----
-
-**Built with ❤️ for the Puch AI Hackathon**
-
-*Use hashtag `#BuildWithPuch` when sharing this project!*
